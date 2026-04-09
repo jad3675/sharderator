@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sharderator"
+version = "0.2.0"
+description = "Frozen tier shard consolidation tool for Elasticsearch"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "PyQt6>=6.6",
+    "elasticsearch>=8.12",
+    "es_client>=8.14",
+    "pyyaml>=6.0",
+    "keyring>=25.0",
+    "structlog>=24.0",
+]
+
+[project.scripts]
+sharderator = "sharderator.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-qt>=4.3",
+    "pytest-cov>=5.0",
+]
