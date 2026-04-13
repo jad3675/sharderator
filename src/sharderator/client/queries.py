@@ -55,8 +55,8 @@ def get_data_stream_membership(client: Elasticsearch) -> dict[str, str]:
         for ds in ds_resp.get("data_streams", []):
             for backing in ds.get("indices", []):
                 membership[backing["index_name"]] = ds["name"]
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("data_stream_membership_failed", error=str(e))
     return membership
 
 
@@ -98,8 +98,12 @@ def enrich_index_info(
                     info.is_data_stream_member = True
                     info.data_stream_name = ds["name"]
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(
+                "data_stream_lookup_failed",
+                index=info.name,
+                error=str(e),
+            )
 
     # Target shard count
     if info.doc_count > 2_000_000_000:

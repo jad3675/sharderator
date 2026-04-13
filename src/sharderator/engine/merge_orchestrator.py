@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QObject, pyqtSignal
+import threading
+import time
 
 from elasticsearch import Elasticsearch
 
 from sharderator.client.tracker import save_job, delete_job, load_job
 from sharderator.engine.cleaner import cleanup_merge
+from sharderator.engine.events import PipelineEvents, NullEvents
 from sharderator.engine.merge_analyzer import MergeGroup
 from sharderator.engine.merger import (
     analyze_merge_group,
@@ -20,6 +22,7 @@ from sharderator.engine.preflight import (
     check_circuit_breakers,
     check_cluster_health_mid_operation,
 )
+from sharderator.engine.sizing import classify_merge_group, get_tier_profile
 from sharderator.engine.snapshotter import snapshot
 from sharderator.engine.swapper import swap_data_stream_merged
 from sharderator.models.index_info import IndexInfo
@@ -30,26 +33,22 @@ from sharderator.util.logging import get_logger
 log = get_logger(__name__)
 
 
-class MergeOrchestrator(QObject):
-    progress = pyqtSignal(str, float)
-    state_changed = pyqtSignal(str, str)
-    log_message = pyqtSignal(str)
-    completed = pyqtSignal(str)
-    failed = pyqtSignal(str, str)
+class MergeOrchestrator:
+    """Runs the merge pipeline for a MergeGroup."""
 
     def __init__(
         self,
         client: Elasticsearch,
         config: OperationConfig,
-        parent: QObject | None = None,
+        events: PipelineEvents | None = None,
     ) -> None:
-        super().__init__(parent)
         self._client = client
         self._config = config
-        self._cancelled = False
+        self._events = events or NullEvents()
+        self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
-        self._cancelled = True
+        self._cancel_event.set()
 
     def run(self, group: MergeGroup) -> None:
         job_name = group.merged_index_name
@@ -71,26 +70,26 @@ class MergeOrchestrator(QObject):
                 job.error = error_msg
             save_job(self._client, job)
             self._emit_state(job_name, JobState.FAILED)
-            self.failed.emit(job_name, error_msg)
+            self._events.on_failed(job_name, error_msg)
             log.error("merge_pipeline_failed", group=job_name, error=error_msg)
 
     def _run_pipeline(self, group: MergeGroup, job: JobRecord) -> None:
         c = self._client
         cfg = self._config
+        ev = self._events
         job_name = group.merged_index_name
 
         def _progress(pct: float) -> None:
-            self.progress.emit(job_name, pct)
+            ev.on_progress(job_name, pct)
 
         def _check_cancel() -> None:
-            if self._cancelled:
+            if self._cancel_event.is_set():
                 raise RuntimeError("Operation cancelled by user")
             check_cluster_health_mid_operation(c)
 
         def _save() -> None:
             save_job(c, job)
 
-        # Pre-flight on fresh jobs
         if job.state == JobState.PENDING:
             check_cluster_health(c, allow_yellow=cfg.allow_yellow_cluster)
             if not cfg.ignore_circuit_breakers:
@@ -108,10 +107,16 @@ class MergeOrchestrator(QObject):
 
         repo = cfg.snapshot_repo or job.repository_name
 
+        # Apply size-tier adaptive timeouts and throttle
+        tier = classify_merge_group(group)
+        tier_profile = get_tier_profile(tier)
+        recovery_timeout = max(cfg.recovery_timeout_minutes, tier_profile.recovery_timeout_minutes)
+        reindex_rps = tier_profile.reindex_rps if tier_profile.reindex_rps > 0 else cfg.reindex_requests_per_second
+
         if job.state == JobState.ANALYZING:
             restore_names = restore_merge_sources(
                 c, enriched, group, job, cfg.working_tier,
-                cfg.recovery_timeout_minutes, _progress,
+                recovery_timeout, _progress,
                 cfg.restore_batch_size, cfg.disk_safety_margin,
             )
             self._emit_state(job_name, job.state)
@@ -123,7 +128,7 @@ class MergeOrchestrator(QObject):
         if job.state == JobState.AWAITING_RECOVERY:
             merged_name = merge_reindex(
                 c, restore_names, enriched, group, job, _progress,
-                cfg.reindex_requests_per_second,
+                reindex_rps,
             )
             self._emit_state(job_name, job.state)
             _save()
@@ -152,8 +157,7 @@ class MergeOrchestrator(QObject):
 
         if job.state == JobState.REMOUNTING:
             job.transition(JobState.VERIFYING)
-            new_stats = c.indices.stats(index=job.new_frozen_index)
-            new_docs = new_stats["_all"]["primaries"]["docs"]["count"]
+            new_docs = _wait_for_frozen_stats(c, job.new_frozen_index)
             if new_docs != job.expected_doc_count:
                 raise RuntimeError(
                     f"Merge doc count mismatch: expected={job.expected_doc_count}, got={new_docs}"
@@ -175,9 +179,32 @@ class MergeOrchestrator(QObject):
 
         job.transition(JobState.COMPLETED)
         self._emit_state(job_name, JobState.COMPLETED)
-        self.completed.emit(job_name)
+        self._events.on_completed(job_name)
         log.info("merge_pipeline_completed", group=job_name)
 
     def _emit_state(self, name: str, state: JobState) -> None:
-        self.state_changed.emit(name, state.value)
-        self.log_message.emit(f"{name}: {state.value}")
+        self._events.on_state_changed(name, state.value)
+        self._events.on_log(f"{name}: {state.value}")
+
+
+def _wait_for_frozen_stats(
+    client: Elasticsearch, index: str, timeout_minutes: int = 5,
+) -> int:
+    """Wait for a newly mounted frozen index to report doc stats."""
+    deadline = time.time() + timeout_minutes * 60
+    last_error = ""
+    while time.time() < deadline:
+        try:
+            client.cluster.health(index=index, wait_for_status="yellow", timeout="10s")
+            stats = client.indices.stats(index=index)
+            primaries = stats.get("_all", {}).get("primaries", {})
+            docs = primaries.get("docs")
+            if docs is not None and "count" in docs:
+                return docs["count"]
+            last_error = f"stats missing docs key"
+        except Exception as e:
+            last_error = str(e)
+        time.sleep(5)
+    raise RuntimeError(
+        f"Timed out waiting for frozen index {index} stats after {timeout_minutes}m: {last_error}"
+    )

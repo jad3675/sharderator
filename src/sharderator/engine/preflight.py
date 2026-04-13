@@ -73,31 +73,104 @@ def check_circuit_breakers(client: Elasticsearch) -> None:
 def check_cluster_health_mid_operation(
     client: Elasticsearch, pause_timeout_minutes: int = 15
 ) -> None:
-    """Mid-operation health check. If cluster goes red, pause and wait.
-    Yellow is fine — most Elastic Cloud clusters run yellow normally.
+    """Mid-operation health check with deeper pressure indicators.
+
+    Checks: red health, thread pool rejections, pending cluster tasks,
+    JVM heap pressure. If any are hot, waits with linear backoff.
     """
+    # Quick red check first
     health = client.cluster.health()
     status = health.get("status", "red")
-    if status != "red":
+
+    if status == "red":
+        log.warning("cluster_red_during_operation", unassigned=health.get("unassigned_shards", 0))
+        _wait_for_not_red(client, pause_timeout_minutes)
         return
 
-    log.warning(
-        "cluster_red_during_operation",
-        unassigned=health.get("unassigned_shards", 0),
-    )
+    # Deeper pressure checks — warn and wait if hot
+    issues = _check_cluster_pressure(client)
+    if not issues:
+        return
 
+    log.warning("cluster_pressure_detected", issues=issues)
     deadline = time.time() + pause_timeout_minutes * 60
+    wait_interval = 30  # linear backoff: 30s, 60s, 90s... up to 300s
+
+    while time.time() < deadline:
+        time.sleep(min(wait_interval, 300))
+        wait_interval += 30
+        issues = _check_cluster_pressure(client)
+        if not issues:
+            log.info("cluster_pressure_resolved")
+            return
+
+    # Don't fail — just log and continue. The operator chose to run.
+    log.warning("cluster_pressure_persists", issues=issues)
+
+
+def _wait_for_not_red(client: Elasticsearch, timeout_minutes: int) -> None:
+    """Wait for cluster to leave red status."""
+    deadline = time.time() + timeout_minutes * 60
     while time.time() < deadline:
         time.sleep(30)
         health = client.cluster.health()
         if health.get("status") != "red":
             log.info("cluster_recovered", status=health.get("status"))
             return
-
     raise ClusterNotHealthyError(
-        f"Cluster has been RED for {pause_timeout_minutes} minutes during operation. "
+        f"Cluster has been RED for {timeout_minutes} minutes. "
         f"Stopping to avoid further damage. Job can be resumed after recovery."
     )
+
+
+def _check_cluster_pressure(client: Elasticsearch) -> list[str]:
+    """Check deeper cluster pressure indicators. Returns list of issues.
+
+    Uses a single nodes.stats call for both thread_pool and jvm metrics
+    to reduce API round-trips on a cluster that may already be under pressure.
+    """
+    issues: list[str] = []
+
+    try:
+        # Pending cluster tasks
+        pending = client.cluster.pending_tasks()
+        task_count = len(pending.get("tasks", []))
+        if task_count > 50:
+            issues.append(f"High pending cluster tasks: {task_count}")
+
+        # Single call for both thread pool and JVM stats
+        stats = client.nodes.stats(metric="thread_pool,jvm")
+        for node_id, node_data in stats.get("nodes", {}).items():
+            node_name = node_data.get("name", node_id)
+
+            # Thread pool queue depths (rejected is cumulative, not useful point-in-time)
+            pools = node_data.get("thread_pool", {})
+            for pool_name in ("write", "search", "snapshot"):
+                pool = pools.get(pool_name, {})
+                queue = pool.get("queue", 0)
+                if queue > 100:
+                    issues.append(f"Thread pool '{pool_name}' queue={queue} on {node_name}")
+
+            # JVM heap pressure
+            heap = node_data.get("jvm", {}).get("mem", {})
+            heap_used = heap.get("heap_used_in_bytes", 0)
+            heap_max = heap.get("heap_max_in_bytes", 0)
+            if heap_max > 0 and heap_used / heap_max > 0.85:
+                issues.append(f"JVM heap at {heap_used / heap_max:.0%} on {node_name}")
+
+        # Relocating/initializing shards
+        health = client.cluster.health()
+        relocating = health.get("relocating_shards", 0)
+        initializing = health.get("initializing_shards", 0)
+        if relocating > 10:
+            issues.append(f"Relocating shards: {relocating}")
+        if initializing > 10:
+            issues.append(f"Initializing shards: {initializing}")
+
+    except Exception as e:
+        log.warning("pressure_check_failed", error=str(e))
+
+    return issues
 
 
 def run_dry_run_preflight(

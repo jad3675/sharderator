@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -20,17 +22,22 @@ from PyQt6.QtWidgets import (
 
 from sharderator.client.connection import ClusterConnection
 from sharderator.client.queries import list_frozen_indices, enrich_index_info, get_data_stream_membership
+from sharderator.client.tracker import delete_job, list_all_jobs
 from sharderator.engine.merge_analyzer import MergeGroup, propose_merges, validate_merge_group
 from sharderator.engine.merge_orchestrator import MergeOrchestrator
 from sharderator.engine.orchestrator import Orchestrator
 from sharderator.engine.preflight import run_dry_run_preflight
 from sharderator.gui.confirm_dialog import ConfirmDialog, MergeConfirmDialog
 from sharderator.gui.connection_dialog import ConnectionDialog
+from sharderator.gui.defrag_widget import DefragWidget
 from sharderator.gui.index_table import IndexTableModel, IndexTableView
 from sharderator.gui.job_log import JobLog
+from sharderator.gui.job_history_dialog import JobHistoryDialog
 from sharderator.gui.merge_tree import MergeTreeWidget
 from sharderator.gui.progress import ProgressWidget
+from sharderator.gui.qt_events import QtPipelineEvents
 from sharderator.gui.settings_dialog import SettingsDialog
+from sharderator.gui.tracker_table import TrackerTableModel, TrackerTableView
 from sharderator.models.index_info import IndexInfo
 from sharderator.models.job import JobRecord
 from sharderator.util.config import AppConfig
@@ -50,11 +57,14 @@ class ShrinkWorkerThread(QThread):
         super().__init__()
         self._orchestrator = orchestrator
         self._indices = indices
-        orchestrator.progress.connect(self.progress)
-        orchestrator.state_changed.connect(self.state_changed)
-        orchestrator.log_message.connect(self.log_message)
-        orchestrator.completed.connect(self.completed)
-        orchestrator.failed.connect(self.failed)
+        # Forward events from the Qt adapter to this thread's signals
+        events = orchestrator._events
+        if isinstance(events, QtPipelineEvents):
+            events.progress.connect(self.progress)
+            events.state_changed.connect(self.state_changed)
+            events.log_message.connect(self.log_message)
+            events.completed.connect(self.completed)
+            events.failed.connect(self.failed)
 
     def run(self) -> None:
         for info in self._indices:
@@ -76,11 +86,13 @@ class MergeWorkerThread(QThread):
         super().__init__()
         self._orchestrator = orchestrator
         self._groups = groups
-        orchestrator.progress.connect(self.progress)
-        orchestrator.state_changed.connect(self.state_changed)
-        orchestrator.log_message.connect(self.log_message)
-        orchestrator.completed.connect(self.completed)
-        orchestrator.failed.connect(self.failed)
+        events = orchestrator._events
+        if isinstance(events, QtPipelineEvents):
+            events.progress.connect(self.progress)
+            events.state_changed.connect(self.state_changed)
+            events.log_message.connect(self.log_message)
+            events.completed.connect(self.completed)
+            events.failed.connect(self.failed)
 
     def run(self) -> None:
         total = len(self._groups)
@@ -126,6 +138,11 @@ class MainWindow(QMainWindow):
         self._btn_settings.setEnabled(False)
         toolbar.addWidget(self._btn_settings)
 
+        self._btn_refresh = QPushButton("Refresh")
+        self._btn_refresh.clicked.connect(self._on_refresh)
+        self._btn_refresh.setEnabled(False)
+        toolbar.addWidget(self._btn_refresh)
+
         # Central widget with tabs
         central = QWidget()
         self.setCentralWidget(central)
@@ -168,6 +185,11 @@ class MainWindow(QMainWindow):
         self._btn_execute.setEnabled(False)
         shrink_btns.addWidget(self._btn_execute)
 
+        self._btn_export_shrink = QPushButton("Export")
+        self._btn_export_shrink.clicked.connect(self._on_export_frozen_indices)
+        self._btn_export_shrink.setEnabled(False)
+        shrink_btns.addWidget(self._btn_export_shrink)
+
         shrink_layout.addLayout(shrink_btns)
         self._tabs.addTab(shrink_tab, "Shrink Mode")
 
@@ -207,8 +229,46 @@ class MainWindow(QMainWindow):
         self._btn_merge_execute.setEnabled(False)
         merge_btns.addWidget(self._btn_merge_execute)
 
+        self._btn_export_merge = QPushButton("Export Dry Run")
+        self._btn_export_merge.clicked.connect(self._on_export_merge_dryrun)
+        self._btn_export_merge.setEnabled(False)
+        merge_btns.addWidget(self._btn_export_merge)
+
         merge_layout.addLayout(merge_btns)
         self._tabs.addTab(merge_tab, "Merge Mode")
+
+        # --- Job Tracker Tab ---
+        tracker_tab = QWidget()
+        tracker_layout = QVBoxLayout(tracker_tab)
+        tracker_layout.setContentsMargins(4, 4, 4, 4)
+
+        tracker_controls = QHBoxLayout()
+        self._btn_refresh_tracker = QPushButton("Refresh Tracker")
+        self._btn_refresh_tracker.clicked.connect(self._load_tracker)
+        self._btn_refresh_tracker.setEnabled(False)
+        tracker_controls.addWidget(self._btn_refresh_tracker)
+
+        self._btn_export_tracker = QPushButton("Export")
+        self._btn_export_tracker.clicked.connect(self._on_export_tracker)
+        self._btn_export_tracker.setEnabled(False)
+        tracker_controls.addWidget(self._btn_export_tracker)
+
+        tracker_controls.addStretch()
+        tracker_layout.addLayout(tracker_controls)
+
+        self._tracker_model = TrackerTableModel()
+        self._tracker_view = TrackerTableView()
+        self._tracker_view.setModel(self._tracker_model)
+        self._tracker_view.on_resume = self._on_tracker_resume
+        self._tracker_view.on_delete = self._on_tracker_delete
+        self._tracker_view.on_view_history = self._on_tracker_history
+        self._tracker_view.on_export_job = self._on_export_single_job
+        tracker_layout.addWidget(self._tracker_view)
+
+        self._lbl_tracker_summary = QLabel("Connect to view tracked jobs")
+        tracker_layout.addWidget(self._lbl_tracker_summary)
+
+        self._tabs.addTab(tracker_tab, "Job Tracker")
 
         # --- Bottom: shared job log + progress ---
         bottom = QWidget()
@@ -217,6 +277,9 @@ class MainWindow(QMainWindow):
 
         self._job_log = JobLog()
         bottom_layout.addWidget(self._job_log)
+
+        self._defrag = DefragWidget()
+        bottom_layout.addWidget(self._defrag)
 
         self._progress = ProgressWidget()
         bottom_layout.addWidget(self._progress)
@@ -227,7 +290,11 @@ class MainWindow(QMainWindow):
         bottom_layout.addWidget(self._btn_cancel)
 
         splitter.addWidget(bottom)
-        splitter.setSizes([450, 200])
+        splitter.setSizes([350, 300])
+
+        # F5 = refresh
+        refresh_shortcut = QShortcut(QKeySequence("F5"), self)
+        refresh_shortcut.activated.connect(self._on_refresh)
 
         self.setStatusBar(QStatusBar())
 
@@ -244,18 +311,26 @@ class MainWindow(QMainWindow):
             )
             self._btn_connect.setText("Disconnect")
             self._btn_settings.setEnabled(True)
+            self._btn_refresh.setEnabled(True)
             self._btn_analyze.setEnabled(True)
             self._btn_analyze_merges.setEnabled(True)
+            self._btn_refresh_tracker.setEnabled(True)
+            self._btn_export_tracker.setEnabled(True)
         else:
             self._lbl_cluster.setText("  Not connected")
             self._btn_connect.setText("Connect")
             self._btn_settings.setEnabled(False)
+            self._btn_refresh.setEnabled(False)
             self._btn_analyze.setEnabled(False)
             self._btn_dryrun.setEnabled(False)
             self._btn_execute.setEnabled(False)
+            self._btn_export_shrink.setEnabled(False)
             self._btn_analyze_merges.setEnabled(False)
             self._btn_merge_dryrun.setEnabled(False)
             self._btn_merge_execute.setEnabled(False)
+            self._btn_export_merge.setEnabled(False)
+            self._btn_refresh_tracker.setEnabled(False)
+            self._btn_export_tracker.setEnabled(False)
 
     @pyqtSlot()
     def _on_connect(self) -> None:
@@ -288,6 +363,7 @@ class MainWindow(QMainWindow):
         has_indices = bool(self._frozen_indices)
         self._btn_dryrun.setEnabled(has_indices)
         self._btn_execute.setEnabled(has_indices)
+        self._btn_export_shrink.setEnabled(has_indices)
         self._btn_merge_dryrun.setEnabled(has_indices)
         self._btn_merge_execute.setEnabled(has_indices)
 
@@ -368,7 +444,9 @@ class MainWindow(QMainWindow):
             return
 
         self._set_running(True)
-        orch = Orchestrator(self._conn.client, self._config.operation)
+        self._defrag.set_indices(selected)
+        events = QtPipelineEvents()
+        orch = Orchestrator(self._conn.client, self._config.operation, events)
         self._worker = ShrinkWorkerThread(orch, selected)
         self._wire_worker_signals(self._worker)
         self._worker.start()
@@ -405,6 +483,7 @@ class MainWindow(QMainWindow):
         self._job_log.append_log(
             f"Merge analysis: {len(groups)} groups, {total_saved} shards saved"
         )
+        self._btn_export_merge.setEnabled(bool(groups))
 
     def _on_merge_execute(self, dry_run: bool) -> None:
         groups = self._merge_tree.get_selected_groups()
@@ -464,7 +543,11 @@ class MainWindow(QMainWindow):
             return
 
         self._set_running(True)
-        orch = MergeOrchestrator(self._conn.client, self._config.operation)
+        # Flatten all source indices across groups for the defrag grid
+        all_sources = [idx for g in groups for idx in g.source_indices]
+        self._defrag.set_indices(all_sources)
+        events = QtPipelineEvents()
+        orch = MergeOrchestrator(self._conn.client, self._config.operation, events)
         self._worker = MergeWorkerThread(orch, groups)
         self._wire_worker_signals(self._worker)
         self._worker.start()
@@ -473,6 +556,8 @@ class MainWindow(QMainWindow):
 
     def _wire_worker_signals(self, worker: ShrinkWorkerThread | MergeWorkerThread) -> None:
         worker.progress.connect(self._progress.update_progress)
+        worker.progress.connect(self._defrag.update_progress)
+        worker.state_changed.connect(self._defrag.update_state)
         worker.log_message.connect(self._job_log.append_log)
         worker.state_changed.connect(
             lambda name, state: self.statusBar().showMessage(f"{name}: {state}")
@@ -498,7 +583,7 @@ class MainWindow(QMainWindow):
     def _on_batch_done(self) -> None:
         self._set_running(False)
         self._progress.reset()
-        self._load_indices()
+        self._on_refresh()
         self._job_log.append_log("=== Batch complete ===")
 
     def _set_running(self, running: bool) -> None:
@@ -511,3 +596,237 @@ class MainWindow(QMainWindow):
         self._btn_cancel.setEnabled(running)
         self._btn_connect.setEnabled(not running)
         self._btn_settings.setEnabled(not running)
+        self._btn_refresh.setEnabled(not running)
+
+    # --- Refresh ---
+
+    @pyqtSlot()
+    def _on_refresh(self) -> None:
+        """Reload cluster metadata, frozen indices, and tracker jobs."""
+        if not self._conn.connected:
+            return
+        self._conn._discover_cluster()
+        self._update_connection_status()
+        self._load_indices()
+        self._load_tracker()
+        self._job_log.append_log("Refreshed cluster state")
+
+    # --- Job Tracker ---
+
+    def _load_tracker(self) -> None:
+        """Load all jobs from the sharderator-tracker index."""
+        if not self._conn.connected:
+            return
+        jobs = list_all_jobs(self._conn.client)
+        self._tracker_model.set_jobs(jobs)
+        if jobs:
+            failed = sum(1 for j in jobs if j.state.value == "FAILED")
+            self._lbl_tracker_summary.setText(
+                f"{len(jobs)} tracked jobs ({failed} failed)"
+            )
+        else:
+            self._lbl_tracker_summary.setText(
+                "No tracked jobs — tracker index will be created on first operation"
+            )
+
+    def _on_tracker_resume(self, job: JobRecord) -> None:
+        """Resume a tracked job from its last committed state."""
+        self._job_log.append_log(f"Resuming {job.index_name} from {job.state.value}...")
+
+        from sharderator.models.job import JobType
+
+        if job.job_type == JobType.SHRINK:
+            info = IndexInfo(
+                name=job.index_name,
+                shard_count=1,
+                doc_count=job.expected_doc_count,
+                store_size_bytes=0,
+            )
+            self._set_running(True)
+            events = QtPipelineEvents()
+            orch = Orchestrator(self._conn.client, self._config.operation, events)
+            self._worker = ShrinkWorkerThread(orch, [info])
+            self._wire_worker_signals(self._worker)
+            self._worker.start()
+
+        elif job.job_type == JobType.MERGE:
+            # Reconstruct MergeGroup from persisted job record
+            group = MergeGroup.from_job_record(job)
+
+            if not group.source_indices:
+                self._job_log.append_log(
+                    "⚠ Cannot resume: no source metadata on job record. "
+                    "Re-run from Merge Mode tab."
+                )
+                return
+
+            self._set_running(True)
+            self._defrag.set_indices(group.source_indices)
+            events = QtPipelineEvents()
+            orch = MergeOrchestrator(
+                self._conn.client, self._config.operation, events
+            )
+            self._worker = MergeWorkerThread(orch, [group])
+            self._wire_worker_signals(self._worker)
+            self._job_log.append_log(
+                f"Resuming merge: {group.base_pattern}/{group.time_bucket} "
+                f"({len(group.source_indices)} source indices)"
+            )
+            self._worker.start()
+
+    def _on_tracker_delete(self, job: JobRecord) -> None:
+        """Delete a job from the tracker index."""
+        reply = QMessageBox.question(
+            self,
+            "Delete Tracked Job",
+            f"Delete tracker record for {job.index_name}?\n\n"
+            f"This does NOT clean up intermediate indices. "
+            f"The job cannot be resumed after deletion.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        delete_job(self._conn.client, job.index_name)
+        self._job_log.append_log(f"Deleted tracker record: {job.index_name}")
+        self._load_tracker()
+
+    def _on_tracker_history(self, job: JobRecord) -> None:
+        """Show the state transition history for a job."""
+        dlg = JobHistoryDialog(job, self)
+        dlg.exec()
+
+    # --- Export ---
+
+    def _on_export_frozen_indices(self) -> None:
+        """Export the frozen index table to CSV or JSON."""
+        if not self._frozen_indices:
+            QMessageBox.information(self, "No Data", "No frozen indices to export.")
+            return
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Export Frozen Indices", "frozen-indices.csv",
+            "CSV (*.csv);;JSON (*.json)"
+        )
+        if not path:
+            return
+        import json, csv as _csv
+        if path.endswith(".json") or "JSON" in selected_filter:
+            rows = [
+                {"name": i.name, "shards": i.shard_count, "docs": i.doc_count,
+                 "size_mb": round(i.store_size_mb, 1), "target_shards": i.target_shard_count}
+                for i in self._frozen_indices
+            ]
+            with open(path, "w") as f:
+                json.dump(rows, f, indent=2)
+        else:
+            with open(path, "w", newline="") as f:
+                writer = _csv.writer(f)
+                writer.writerow(["name", "shards", "docs", "size_mb", "target_shards"])
+                for i in self._frozen_indices:
+                    writer.writerow([i.name, i.shard_count, i.doc_count,
+                                     round(i.store_size_mb, 1), i.target_shard_count])
+        self._job_log.append_log(f"Exported {len(self._frozen_indices)} indices to {path}")
+
+    def _on_export_merge_dryrun(self) -> None:
+        """Export a merge dry-run report as JSON."""
+        groups = self._merge_tree.get_selected_groups()
+        if not groups:
+            # Export all groups if none selected
+            groups = self._merge_tree._groups
+        if not groups:
+            QMessageBox.information(self, "No Data", "Run Analyze Merges first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Merge Dry Run", "sharderator-merge-plan.json", "JSON (*.json)"
+        )
+        if not path:
+            return
+        import json, time as _time
+        from sharderator.engine.sizing import generate_sizing_report
+        from sharderator.engine.preflight import run_dry_run_preflight
+        report = generate_sizing_report(
+            self._conn.client, mode=f"Merge ({self._config.operation.merge_granularity})",
+            groups=groups, safety_margin=self._config.operation.disk_safety_margin,
+            frozen_shards=self._conn.frozen_shard_count, frozen_limit=self._conn.frozen_shard_limit,
+        )
+        total_bytes = sum(g.total_size_bytes for g in groups) * 2
+        issues = run_dry_run_preflight(
+            self._conn.client, allow_yellow=self._config.operation.allow_yellow_cluster,
+            disk_safety_margin=self._config.operation.disk_safety_margin,
+            needed_bytes=total_bytes,
+            ignore_circuit_breakers=self._config.operation.ignore_circuit_breakers,
+        )
+        report_data = report.to_dict()
+        report_data["groups"] = [
+            {
+                "base_pattern": g.base_pattern,
+                "time_bucket": g.time_bucket,
+                "source_count": len(g.source_indices),
+                "source_indices": [i.name for i in g.source_indices],
+                "shard_reduction": g.shard_reduction,
+                "total_size_bytes": g.total_size_bytes,
+                "mapping_conflicts": g.mapping_conflicts,
+            }
+            for g in groups
+        ]
+        report_data["preflight_issues"] = issues
+        report_data["preflight_passed"] = len(issues) == 0
+        report_data["timestamp"] = _time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        with open(path, "w") as f:
+            json.dump(report_data, f, indent=2)
+        self._job_log.append_log(f"Exported merge plan ({len(groups)} groups) to {path}")
+
+    def _on_export_tracker(self) -> None:
+        """Export all tracked jobs as JSON."""
+        jobs = list_all_jobs(self._conn.client)
+        if not jobs:
+            QMessageBox.information(self, "No Jobs", "No tracked jobs to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Job History", "sharderator-history.json", "JSON (*.json)"
+        )
+        if not path:
+            return
+        import json, time as _time
+        output = {
+            "exported_at": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "cluster": self._conn.cluster_name,
+            "job_count": len(jobs),
+            "jobs": [j.to_dict() for j in jobs],
+        }
+        with open(path, "w") as f:
+            json.dump(output, f, indent=2, default=str)
+        self._job_log.append_log(f"Exported {len(jobs)} jobs to {path}")
+
+    def _on_export_single_job(self, job: JobRecord) -> None:
+        """Export a single job record as JSON (from context menu)."""
+        safe_name = job.index_name.replace("/", "-").replace(":", "-")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Job", f"sharderator-job-{safe_name}.json", "JSON (*.json)"
+        )
+        if not path:
+            return
+        import json
+        with open(path, "w") as f:
+            json.dump(job.to_dict(), f, indent=2, default=str)
+        self._job_log.append_log(f"Exported job {job.index_name} to {path}")
+
+    def closeEvent(self, event) -> None:
+        """Graceful shutdown — cancel running pipeline and wait for thread."""
+        if self._worker and self._worker.isRunning():
+            reply = QMessageBox.question(
+                self,
+                "Operation Running",
+                "A pipeline is running. Cancel and exit?\n\n"
+                "The job can be resumed on next launch.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+
+            self._on_cancel()
+            self._worker.wait(10000)  # 10s timeout
+            if self._worker.isRunning():
+                self._worker.terminate()
+
+        event.accept()

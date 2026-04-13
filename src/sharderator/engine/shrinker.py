@@ -7,6 +7,7 @@ import time
 from elasticsearch import Elasticsearch
 
 from sharderator.client.queries import get_warm_hot_nodes
+from sharderator.engine.task_waiter import wait_for_task
 from sharderator.models.index_info import IndexInfo
 from sharderator.models.job import JobRecord, JobState
 from sharderator.util.logging import get_logger
@@ -31,12 +32,37 @@ def shrink(
 
     if info.needs_reindex:
         log.info("using_reindex_fallback", index=restore_name, target=shrunk_name)
-        _reindex(client, info, restore_name, shrunk_name, requests_per_second)
+        task_id = _reindex_async(client, info, restore_name, shrunk_name, requests_per_second)
+        job.merge_task_id = task_id  # reuse field for the reindex task
     else:
         log.info("using_shrink", index=restore_name, target=shrunk_name)
         _shrink(client, info, restore_name, shrunk_name)
 
     return shrunk_name
+
+
+def wait_for_shrink(
+    client: Elasticsearch,
+    shrunk_name: str,
+    job: JobRecord,
+    timeout_minutes: int = 30,
+) -> None:
+    """Wait for the shrunk index to be green (after shrink API)."""
+    job.transition(JobState.AWAITING_SHRINK)
+    _wait_for_green(client, shrunk_name, timeout_minutes)
+    log.info("shrink_complete", index=shrunk_name)
+
+
+def wait_for_reindex(
+    client: Elasticsearch,
+    job: JobRecord,
+    timeout_minutes: int = 120,
+    progress_callback=None,
+) -> None:
+    """Wait for async reindex task to complete (reindex fallback path)."""
+    job.transition(JobState.AWAITING_REINDEX)
+    wait_for_task(client, job.merge_task_id, progress_callback, timeout_minutes)
+    log.info("reindex_complete", index=job.shrunk_index)
 
 
 def _shrink(
@@ -50,10 +76,14 @@ def _shrink(
     if not nodes:
         raise RuntimeError("No warm/hot nodes available for shrink allocation")
 
+    # Clean up stale shrunk index from a previous failed run
+    if client.indices.exists(index=target):
+        log.warning("shrunk_exists_deleting", index=target)
+        client.indices.delete(index=target)
+
     best_node = max(nodes, key=lambda n: int(n.get("disk.avail", 0) or 0))
     node_name = best_node["name"]
 
-    # Relocate all primaries to one node and set read-only
     client.indices.put_settings(
         index=source,
         settings={
@@ -62,12 +92,8 @@ def _shrink(
         },
     )
 
-    # Fix 2.4: Wait for all primaries to actually land on the target node.
-    # _wait_for_green only checks allocation status, not colocation.
-    # The shrink API will fail if shards aren't all on the same node.
     _wait_for_colocation(client, source, node_name)
 
-    # Execute shrink
     client.indices.shrink(
         index=source,
         target=target,
@@ -81,14 +107,19 @@ def _shrink(
     )
 
 
-def _reindex(
+def _reindex_async(
     client: Elasticsearch,
     info: IndexInfo,
     source: str,
     target: str,
     requests_per_second: float = -1,
-) -> None:
-    """Fallback: reindex to a new index with fewer shards."""
+) -> str:
+    """Async reindex fallback. Returns task ID for polling."""
+    # Clean up stale shrunk index from a previous failed run
+    if client.indices.exists(index=target):
+        log.warning("shrunk_exists_deleting", index=target)
+        client.indices.delete(index=target)
+
     client.indices.create(
         index=target,
         settings={
@@ -99,24 +130,17 @@ def _reindex(
         mappings=info.mappings,
     )
 
-    body = {
-        "source": {"index": source},
-        "dest": {"index": target, "op_type": "create"},
-    }
     rps = requests_per_second if requests_per_second > 0 else None
-    client.reindex(body=body, wait_for_completion=True, requests_per_second=rps, request_timeout=3600)
-
-
-def wait_for_shrink(
-    client: Elasticsearch,
-    shrunk_name: str,
-    job: JobRecord,
-    timeout_minutes: int = 30,
-) -> None:
-    """Wait for the shrunk index to be green."""
-    job.transition(JobState.AWAITING_SHRINK)
-    _wait_for_green(client, shrunk_name, timeout_minutes)
-    log.info("shrink_complete", index=shrunk_name)
+    resp = client.reindex(
+        body={
+            "source": {"index": source},
+            "dest": {"index": target, "op_type": "create"},
+        },
+        wait_for_completion=False,
+        requests_per_second=rps,
+        request_timeout=30,
+    )
+    return resp.get("task", "")
 
 
 def _wait_for_colocation(
@@ -125,11 +149,7 @@ def _wait_for_colocation(
     target_node: str,
     timeout_minutes: int = 30,
 ) -> None:
-    """Wait until all primary shards are on the target node.
-
-    Fix 2.4: Green health doesn't guarantee colocation. The shrink API
-    requires all primaries on the same node. Poll _cat/shards to confirm.
-    """
+    """Wait until all primary shards are on the target node."""
     deadline = time.time() + timeout_minutes * 60
     while time.time() < deadline:
         shards = client.cat.shards(index=index, format="json", h="node,prirep")

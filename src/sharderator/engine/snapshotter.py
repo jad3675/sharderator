@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 
 from elasticsearch import Elasticsearch
@@ -45,6 +46,33 @@ def snapshot(
     return snap_name
 
 
+def _is_forcemerge_for_index(task_info: dict, index: str) -> bool:
+    """Check if a force merge task is targeting a specific index.
+
+    ES forcemerge task descriptions use the format:
+        "Force-merge indices [<index_name>], ..."
+    We check for the index name inside square brackets to avoid
+    substring false positives (e.g., 'logs-1' matching 'logs-10').
+    """
+    description = task_info.get("description", "")
+    if not description:
+        return False
+
+    # Primary check: exact match inside brackets
+    if f"[{index}]" in description:
+        return True
+
+    # Fallback: extract all bracket contents and check for exact match
+    # (handles comma-separated index lists and older ES description formats)
+    bracket_contents = re.findall(r'\[([^\]]+)\]', description)
+    for content in bracket_contents:
+        names = [n.strip() for n in content.split(",")]
+        if index in names:
+            return True
+
+    return False
+
+
 def _force_merge_safe(
     client: Elasticsearch, index: str, timeout_minutes: int = 120
 ) -> None:
@@ -58,7 +86,7 @@ def _force_merge_safe(
         tasks = client.tasks.list(actions="*forcemerge*", detailed=True)
         for node_tasks in tasks.get("nodes", {}).values():
             for task_info in node_tasks.get("tasks", {}).values():
-                if index in task_info.get("description", ""):
+                if _is_forcemerge_for_index(task_info, index):
                     log.warning("force_merge_already_running", index=index)
                     _wait_for_forcemerge_completion(client, index, timeout_minutes)
                     return
@@ -92,7 +120,7 @@ def _wait_for_forcemerge_completion(
         try:
             tasks = client.tasks.list(actions="*forcemerge*", detailed=True)
             still_running = any(
-                index in task_info.get("description", "")
+                _is_forcemerge_for_index(task_info, index)
                 for node_tasks in tasks.get("nodes", {}).values()
                 for task_info in node_tasks.get("tasks", {}).values()
             )

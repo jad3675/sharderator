@@ -15,6 +15,7 @@ class JobState(enum.Enum):
     AWAITING_RECOVERY = "AWAITING_RECOVERY"
     SHRINKING = "SHRINKING"
     AWAITING_SHRINK = "AWAITING_SHRINK"
+    AWAITING_REINDEX = "AWAITING_REINDEX"
     MERGING = "MERGING"
     AWAITING_MERGE = "AWAITING_MERGE"
     FORCE_MERGING = "FORCE_MERGING"
@@ -39,8 +40,9 @@ TRANSITIONS: dict[JobState, list[JobState]] = {
     JobState.ANALYZING: [JobState.RESTORING, JobState.FAILED],
     JobState.RESTORING: [JobState.AWAITING_RECOVERY, JobState.FAILED],
     JobState.AWAITING_RECOVERY: [JobState.SHRINKING, JobState.MERGING, JobState.FAILED],
-    JobState.SHRINKING: [JobState.AWAITING_SHRINK, JobState.FAILED],
+    JobState.SHRINKING: [JobState.AWAITING_SHRINK, JobState.AWAITING_REINDEX, JobState.FAILED],
     JobState.AWAITING_SHRINK: [JobState.FORCE_MERGING, JobState.FAILED],
+    JobState.AWAITING_REINDEX: [JobState.FORCE_MERGING, JobState.FAILED],
     JobState.MERGING: [JobState.AWAITING_MERGE, JobState.FAILED],
     JobState.AWAITING_MERGE: [JobState.FORCE_MERGING, JobState.FAILED],
     JobState.FORCE_MERGING: [JobState.SNAPSHOTTING, JobState.FAILED],
@@ -99,51 +101,23 @@ class JobRecord:
             self.error = error
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "index_name": self.index_name,
-            "job_type": self.job_type.value,
-            "state": self.state.value,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "error": self.error,
-            "restore_index": self.restore_index,
-            "shrunk_index": self.shrunk_index,
-            "new_snapshot_name": self.new_snapshot_name,
-            "new_frozen_index": self.new_frozen_index,
-            "original_snapshot_name": self.original_snapshot_name,
-            "repository_name": self.repository_name,
-            "expected_doc_count": self.expected_doc_count,
-            "restore_indices": self.restore_indices,
-            "merge_task_id": self.merge_task_id,
-            "source_frozen_indices": self.source_frozen_indices,
-            "enriched_metadata": self.enriched_metadata,
-            "history": self.history,
-        }
+        import dataclasses
+        d = dataclasses.asdict(self)
+        d["state"] = self.state.value
+        d["job_type"] = self.job_type.value
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> JobRecord:
-        jt_raw = data.get("job_type", "SHRINK")
+        import dataclasses
+        data = dict(data)
+        data["state"] = JobState(data.get("state", "PENDING"))
+        raw_jt = data.get("job_type", "SHRINK")
         try:
-            jt = JobType(jt_raw)
+            data["job_type"] = JobType(raw_jt)
         except ValueError:
-            jt = JobType.SHRINK
-        return cls(
-            index_name=data["index_name"],
-            job_type=jt,
-            state=JobState(data["state"]),
-            created_at=data.get("created_at", 0),
-            updated_at=data.get("updated_at", 0),
-            error=data.get("error", ""),
-            restore_index=data.get("restore_index", ""),
-            shrunk_index=data.get("shrunk_index", ""),
-            new_snapshot_name=data.get("new_snapshot_name", ""),
-            new_frozen_index=data.get("new_frozen_index", ""),
-            original_snapshot_name=data.get("original_snapshot_name", ""),
-            repository_name=data.get("repository_name", ""),
-            expected_doc_count=data.get("expected_doc_count", 0),
-            restore_indices=data.get("restore_indices", []),
-            merge_task_id=data.get("merge_task_id", ""),
-            source_frozen_indices=data.get("source_frozen_indices", []),
-            enriched_metadata=data.get("enriched_metadata", []),
-            history=data.get("history", []),
-        )
+            data["job_type"] = JobType.SHRINK
+        # Drop unknown keys from older/newer tracker docs
+        valid = {f.name for f in dataclasses.fields(cls)}
+        data = {k: v for k, v in data.items() if k in valid}
+        return cls(**data)

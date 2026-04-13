@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from sharderator.models.index_info import IndexInfo
+
+if TYPE_CHECKING:
+    from sharderator.models.job import JobRecord
 
 # Pattern to extract base name and date from common index naming conventions.
 # Handles: .ds-metrics-system.cpu-default-2026.02.14-000804
@@ -28,6 +32,7 @@ class MergeGroup:
     merged_index_name: str = ""
     total_docs: int = 0
     total_size_bytes: int = 0
+    mapping_conflicts: list[str] = field(default_factory=list)
 
     @property
     def source_shard_count(self) -> int:
@@ -40,6 +45,40 @@ class MergeGroup:
     @property
     def total_size_mb(self) -> float:
         return self.total_size_bytes / (1024 * 1024)
+
+    @classmethod
+    def from_job_record(cls, job: "JobRecord") -> "MergeGroup":
+        """Reconstruct a MergeGroup from a persisted merge job record.
+
+        Used by the GUI tracker resume to restart merge jobs without
+        requiring the operator to re-select the group in the Merge tab.
+        """
+        base_pattern, time_bucket = _parse_merged_name(job.index_name)
+
+        # Reconstruct source IndexInfo from enriched_metadata
+        source_indices: list[IndexInfo] = []
+        if job.enriched_metadata:
+            for meta in job.enriched_metadata:
+                source_indices.append(IndexInfo(**meta))
+        else:
+            # Fallback: minimal IndexInfo from source names only.
+            # The orchestrator will re-enrich if needed.
+            for idx_name in job.source_frozen_indices:
+                source_indices.append(IndexInfo(
+                    name=idx_name, shard_count=1,
+                    doc_count=0, store_size_bytes=0,
+                ))
+
+        total_size = sum(i.store_size_bytes for i in source_indices)
+
+        return cls(
+            base_pattern=base_pattern,
+            time_bucket=time_bucket,
+            source_indices=source_indices,
+            merged_index_name=job.index_name,
+            total_docs=job.expected_doc_count,
+            total_size_bytes=total_size,
+        )
 
 
 def propose_merges(
@@ -80,11 +119,13 @@ def propose_merges(
     return groups
 
 
-def union_mappings(mappings: list[dict]) -> dict:
+def union_mappings(mappings: list[dict]) -> tuple[dict, list[str]]:
     """Merge multiple index mappings into a superset.
 
-    When merging indices from the same base pattern, mappings should be identical.
-    But drift happens (new fields added over time). This computes the union.
+    Returns (merged_mapping, conflicts) where conflicts is a list of
+    human-readable strings describing field type conflicts. First-seen-wins
+    for resolution — the conflicts list gives the operator visibility into
+    what was silently resolved.
     """
     result: dict = {"properties": {}}
     conflicts: list[str] = []
@@ -100,7 +141,7 @@ def union_mappings(mappings: list[dict]) -> dict:
                 new_type = field_def.get("type")
                 if existing_type and new_type and existing_type != new_type:
                     conflicts.append(
-                        f"{field_name}: {existing_type} vs {new_type}"
+                        f"'{field_name}': {existing_type} kept, {new_type} dropped"
                     )
                     # Keep the first definition
 
@@ -110,7 +151,7 @@ def union_mappings(mappings: list[dict]) -> dict:
             if key != "properties" and key not in result:
                 result[key] = val
 
-    return result
+    return result, conflicts
 
 
 def _date_to_bucket(date_str: str, granularity: str) -> str:
@@ -125,6 +166,37 @@ def _date_to_bucket(date_str: str, granularity: str) -> str:
     elif granularity == "yearly":
         return year
     return f"{year}.{month}"
+
+
+def _parse_merged_name(name: str) -> tuple[str, str]:
+    """Extract base_pattern and time_bucket from a merged index name.
+
+    Handles both naming formats:
+      partial-.ds-metrics-system.cpu-default-2026.02-merged  (final frozen mount)
+      sharderator-merged-metrics-system.cpu-default-2026.02  (intermediate working name)
+
+    The time bucket is the last hyphen-delimited segment. This works for
+    monthly (2026.02), quarterly (2026.Q1), and yearly (2026) buckets.
+    """
+    stripped = name
+
+    # Strip the final frozen mount format
+    if stripped.endswith("-merged"):
+        stripped = stripped[: -len("-merged")]
+        for prefix in ("partial-.ds-", ".partial-.ds-", "partial-", ".partial-"):
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):]
+                break
+
+    # Strip the intermediate working name format
+    elif stripped.startswith("sharderator-merged-"):
+        stripped = stripped[len("sharderator-merged-"):]
+
+    # The time bucket is the last segment
+    parts = stripped.rsplit("-", 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return stripped, "unknown"
 
 
 @dataclass
@@ -186,6 +258,15 @@ def validate_merge_group(
                     f"Field drift between first/last: {', '.join(sorted(diff)[:5])}"
                     + (f" (+{len(diff) - 5} more)" if len(diff) > 5 else "")
                 )
+
+            # Also check for type conflicts between first and last
+            sampled = [
+                first_mapping[first_name]["mappings"],
+                last_mapping[last_name]["mappings"],
+            ]
+            _, type_conflicts = union_mappings(sampled)
+            for c in type_conflicts:
+                result.mapping_conflicts.append(f"Type conflict: {c}")
         except Exception:
             pass
 

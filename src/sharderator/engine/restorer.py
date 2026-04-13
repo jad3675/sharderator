@@ -37,6 +37,11 @@ def restore(
     # HARD GATE: refuse if working tier can't hold the restore safely
     _check_disk_space(client, info, safety_margin)
 
+    # Clean up stale restore index from a previous failed run
+    if client.indices.exists(index=restore_name):
+        log.warning("restore_exists_deleting", index=restore_name)
+        client.indices.delete(index=restore_name)
+
     body = {
         "indices": info.original_index_name,
         "rename_pattern": "(.+)",

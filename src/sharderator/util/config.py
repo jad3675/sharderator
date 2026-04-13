@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,27 +47,8 @@ class AppConfig:
     def save(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         data = {
-            "connection": {
-                "cloud_id": self.connection.cloud_id,
-                "hosts": self.connection.hosts,
-                "username": self.connection.username,
-                "use_api_key": self.connection.use_api_key,
-                "verify_certs": self.connection.verify_certs,
-            },
-            "operation": {
-                "target_shard_count": self.operation.target_shard_count,
-                "working_tier": self.operation.working_tier,
-                "snapshot_repo": self.operation.snapshot_repo,
-                "recovery_timeout_minutes": self.operation.recovery_timeout_minutes,
-                "delete_old_snapshots": self.operation.delete_old_snapshots,
-                "dry_run": self.operation.dry_run,
-                "merge_granularity": self.operation.merge_granularity,
-                "disk_safety_margin": self.operation.disk_safety_margin,
-                "restore_batch_size": self.operation.restore_batch_size,
-                "reindex_requests_per_second": self.operation.reindex_requests_per_second,
-                "allow_yellow_cluster": self.operation.allow_yellow_cluster,
-                "ignore_circuit_breakers": self.operation.ignore_circuit_breakers,
-            },
+            "connection": dataclasses.asdict(self.connection),
+            "operation": dataclasses.asdict(self.operation),
         }
         with open(CONFIG_FILE, "w") as f:
             yaml.dump(data, f, default_flow_style=False)
@@ -78,28 +60,12 @@ class AppConfig:
             with open(CONFIG_FILE) as f:
                 data = yaml.safe_load(f) or {}
             conn = data.get("connection", {})
-            cfg.connection = ConnectionConfig(
-                cloud_id=conn.get("cloud_id", ""),
-                hosts=conn.get("hosts", []),
-                username=conn.get("username", ""),
-                use_api_key=conn.get("use_api_key", True),
-                verify_certs=conn.get("verify_certs", True),
-            )
+            valid_conn = {f.name for f in dataclasses.fields(ConnectionConfig)}
+            cfg.connection = ConnectionConfig(**{k: v for k, v in conn.items() if k in valid_conn})
+
             op = data.get("operation", {})
-            cfg.operation = OperationConfig(
-                target_shard_count=op.get("target_shard_count", 1),
-                working_tier=op.get("working_tier", "data_warm,data_hot,data_content"),
-                snapshot_repo=op.get("snapshot_repo", ""),
-                recovery_timeout_minutes=op.get("recovery_timeout_minutes", 30),
-                delete_old_snapshots=op.get("delete_old_snapshots", False),
-                dry_run=op.get("dry_run", True),
-                merge_granularity=op.get("merge_granularity", "monthly"),
-                disk_safety_margin=op.get("disk_safety_margin", 0.30),
-                restore_batch_size=op.get("restore_batch_size", 3),
-                reindex_requests_per_second=op.get("reindex_requests_per_second", 5000.0),
-                allow_yellow_cluster=op.get("allow_yellow_cluster", True),
-                ignore_circuit_breakers=op.get("ignore_circuit_breakers", False),
-            )
+            valid_op = {f.name for f in dataclasses.fields(OperationConfig)}
+            cfg.operation = OperationConfig(**{k: v for k, v in op.items() if k in valid_op})
         return cfg
 
     @staticmethod
