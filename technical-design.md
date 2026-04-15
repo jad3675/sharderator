@@ -1,13 +1,13 @@
 # Sharderator — Technical Design Document
 
 Date: April 2026
-Version: 0.2.0
+Version: 0.3.0
 
 ---
 
 ## 1. Background
 
-Elastic Cloud's frozen tier stores data as partially mounted searchable snapshots backed by object storage (S3, GCS, Azure Blob). Each frozen data node has a hard shard limit of 3,000 (`cluster.max_shards_per_node.frozen`). In managed environments with hundreds of ILM-driven indices, this budget fills up fast — either because indices arrive with too many primary shards, or because daily index patterns create one shard per day per metric type.
+Elastic Cloud's frozen tier stores data as partially mounted searchable snapshots backed by object storage (S3, GCS, Azure Blob). Each frozen data node has a hard shard limit (`cluster.max_shards_per_node.frozen` — 3,000 default, 1,000 on trial clusters). In managed environments with hundreds of ILM-driven indices, this budget fills up fast — either because indices arrive with too many primary shards, or because daily index patterns create one shard per day per metric type.
 
 Frozen indices are immutable. You cannot shrink, reindex, or forcemerge them in place. The only way to restructure them is to restore a full copy from the backing snapshot to a writable tier, mutate it, re-snapshot, and re-mount.
 
@@ -153,7 +153,7 @@ After analysis, classifies the index into a size tier (SMALL/MEDIUM/LARGE/HUGE) 
 
 Hard disk space gate: calculates post-restore free percentage on warm/hot/content nodes only (not all nodes — frozen nodes with terabytes free can't be used for restores). If free space would drop below the safety margin (default 30%), the operation is refused with `InsufficientDiskError`.
 
-Restores from the backing snapshot with `_tier_preference` override to route to the working tier, zero replicas, and a `sharderator-restore-` prefix to avoid name collisions.
+Restores from the backing snapshot with `_tier_preference` override to route to the working tier, zero replicas, and a `sharderator-restore-` prefix to avoid name collisions. Detects and cleans up orphaned intermediate indices from previous failed runs before restoring.
 
 ### 5.3 Shrinking
 
@@ -169,9 +169,9 @@ Creates a one-off snapshot with `sharderator-{original_name}-{timestamp}` naming
 
 ### 5.5 Remounting and Verification
 
-Mounts the new snapshot as `shared_cache` (frozen) with a temporary name to avoid collision with the still-existing old mount. Strips ILM (`index.lifecycle.indexing_complete: true`) to prevent re-processing.
+Mounts the new snapshot as `shared_cache` (frozen) with a `partial-sharderator-{name}` naming convention so the new mount is visible to `list_frozen_indices`, `_count_frozen_shards`, and sizing reports. Checks for and deletes stale mounts from previous failed runs before mounting. Strips ILM (`index.lifecycle.indexing_complete: true`) to prevent re-processing.
 
-Verification compares the stored expected doc count against the new mount's actual count, checks shard count matches target, confirms green health, and validates mapping field equivalence.
+Verification uses `_wait_for_doc_count()` which polls with a 60-second timeout for frozen index stats to become available (frozen indices are partially mounted searchable snapshots; their stats can take several seconds to populate after mount). Compares the stored expected doc count against the new mount's actual count, checks shard count matches target, confirms green health, and validates mapping field equivalence.
 
 ### 5.6 Swapping
 
@@ -222,13 +222,14 @@ After verification, all source backing indices across all data streams are remov
 
 Run at the start of every fresh job (not on resume) and during dry runs:
 - Cluster health: red = block, yellow = configurable, >10 relocating/initializing shards = block
-- Circuit breakers: any breaker >80% = block (overridable via settings)
+- Circuit breakers: any breaker >80% triggers adaptive wait (see 7.4)
 - Disk space: calculates post-operation free percentage on working tier nodes only
 
 ### 7.2 Mid-Operation Monitoring
 
-Between every pipeline stage, `_check_cancel` also calls `check_cluster_health_mid_operation`. This now checks:
+Between every pipeline stage, `_check_cancel` also calls `check_cluster_health_mid_operation`. This checks:
 - Red cluster status (pause up to 15 minutes, then abort)
+- Circuit breaker ratios at 75% threshold (5 points below the hard gate)
 - Thread pool queue depths (write, search, snapshot) — warns if queue > 100
 - Pending cluster tasks — warns if > 50
 - JVM heap pressure — warns if any node > 85%
@@ -240,13 +241,50 @@ On pressure detection, waits with linear backoff (30s, 60s, 90s... up to 300s ca
 
 The SWAPPING state (data stream modification) was deliberately separated from REMOUNTING and placed after VERIFYING. This ensures that the irreversible data stream mutation only happens after we've confirmed the new mount is healthy. If verification fails, the data stream still points at the original index.
 
-### 7.4 Job Persistence
+### 7.4 Circuit Breaker Adaptive Backpressure
+
+Three layers of circuit breaker awareness prevent cascading failures during batch operations:
+
+**Layer A — Wait-capable preflight gate (`check_circuit_breakers`):**
+When a circuit breaker exceeds 80%, instead of failing immediately, the function enters a linear backoff loop (30s, 60s, 90s… capped at 300s). If pressure clears within the configurable timeout (`circuit_breaker_wait_minutes`, default 10), the operation proceeds. If not, it raises `ClusterNotHealthyError`. Setting the timeout to 0 restores old fail-fast behavior.
+
+**Layer B — Mid-operation breaker awareness (`_check_cluster_pressure`):**
+The mid-operation pressure check now includes circuit breaker ratios via `_get_hot_breakers(threshold=0.75)`. The 75% threshold is intentionally 5 points below the 80% hard gate — this means mid-operation pauses kick in before the next index's preflight would reject, giving the cluster headroom to settle.
+
+**Layer C — Inter-index backpressure (`wait_for_cluster_ready`):**
+Called between indices/groups in all four batch loops (CLI shrink, CLI merge, GUI ShrinkWorkerThread, GUI MergeWorkerThread). Combines health + breaker + pressure checks with adaptive waiting. If all checks pass immediately, returns with zero delay — no artificial overhead on healthy clusters. Configurable via `batch_backpressure_timeout_minutes` (default 15, 0 = disabled).
+
+The shared helper `_get_hot_breakers(client, threshold)` scans all nodes for circuit breakers above the given threshold and returns `(breaker_name, node_name, ratio)` tuples. Both the preflight gate and the pressure check use this helper, eliminating code duplication.
+
+**Behavior before backpressure:**
+```
+Index 1: COMPLETED
+Index 2: COMPLETED
+Index 3: COMPLETED  (cluster now at 82% breaker)
+Index 4: FAILED     (instant — 0s wait)
+Index 5: FAILED     (instant)
+...
+```
+
+**Behavior after backpressure (defaults):**
+```
+Index 1: COMPLETED
+Index 2: COMPLETED
+Index 3: COMPLETED  (cluster now at 82% breaker)
+  [batch loop] Pressure detected: parent breaker at 82% — waiting...
+  [batch loop] +30s: still at 78% — waiting...
+  [batch loop] +90s: pressure resolved
+Index 4: COMPLETED  (breaker had settled to 65%)
+...
+```
+
+### 7.5 Job Persistence
 
 Every state transition is persisted to the `sharderator-tracker` Elasticsearch index via `save_job`. On restart, `load_job` retrieves the last known state. FAILED jobs are treated as fresh starts on retry (the stale record is deleted). Merge jobs serialize enriched index metadata into the job record so resume doesn't require re-querying source indices that may have been partially cleaned up.
 
 `JobRecord.to_dict()` uses `dataclasses.asdict()` — new fields added to the dataclass are automatically included in serialization. `from_dict()` filters to valid field names so unknown keys from older/newer tracker docs are dropped cleanly.
 
-### 7.5 Size-Tier Adaptive Timeouts
+### 7.6 Size-Tier Adaptive Timeouts
 
 After ANALYZING, both orchestrators classify the index/group into a size tier and pull a `TierProfile`:
 
@@ -261,7 +299,7 @@ The orchestrator uses `max(cfg.recovery_timeout_minutes, tier_profile.recovery_t
 
 ## 8. Defrag Visualization Widget
 
-A per-shard cell grid inspired by the Windows 95/98/XP defrag utility. Each shard in every index gets its own 10×10 pixel square cell in a continuous grid — an 18-index merge batch with 7-11 shards each becomes ~160 individual cells filling a proper chunky grid.
+A per-shard cell grid inspired by the Windows 95/98/XP defrag utility. Each shard in every index gets its own 10x10 pixel square cell in a continuous grid — an 18-index merge batch with 7-11 shards each becomes ~160 individual cells filling a proper chunky grid.
 
 The data model uses `ShardCell` (one per shard) grouped into `IndexGroup` (one per index). State transitions use a staggered sweep animation (30ms per cell) that lights up each shard sequentially, creating the classic "scan head moving across the disk" effect.
 
@@ -273,18 +311,21 @@ A legend bar below the status text shows colored squares with labels for the key
 
 Tooltips show per-cell detail: index name, shard number (e.g., "Shard: 3/7"), state, target, and progress.
 
-The CLI equivalent uses ANSI-colored `▓` block characters that wrap to terminal width and update in-place via cursor-up + clear.
+The CLI equivalent uses ANSI-colored block characters that wrap to terminal width and update in-place via cursor-up + clear.
 
 ## 9. CLI Mode
 
-`sharderator-cli` provides headless operation with no PyQt6 dependency. Subcommands: `list`, `status`, `shrink`, `merge`. Full argument parsing for connection and operation settings, environment variable support (`ES_API_KEY`, `ES_PASSWORD`), and SIGINT/SIGTERM signal handling for graceful cancellation.
+`sharderator-cli` provides headless operation with no PyQt6 dependency. Subcommands: `list`, `status`, `shrink`, `merge`, `report`. Full argument parsing for connection and operation settings, environment variable support (`ES_API_KEY`, `ES_PASSWORD`), and SIGINT/SIGTERM signal handling for graceful cancellation.
 
 The CLI reuses the same `Orchestrator` and `MergeOrchestrator` classes as the GUI, passing a `CliEvents` implementation instead of `QtPipelineEvents`. No `QApplication` instance is needed.
 
 Additional CLI features:
 - `--order smallest-first|largest-first|as-is` on both shrink and merge
 - `--priority "pattern1,pattern2"` on merge to move matching groups to the front
+- `--output table|json` for dry-run format selection
+- `--breaker-wait` and `--backpressure-wait` for circuit breaker backpressure tuning
 - Pre-run sizing reports during `--dry-run`
+- Export: `--csv` and `--json` on `list`, JSON output on `report`
 
 ## 10. Thread Safety
 
@@ -296,23 +337,71 @@ The `swapper.py` module uses add-before-remove ordering in `_data_stream/_modify
 
 For merge mode, `_atomic_swap_multi_ds` collapses all add/remove actions across all data streams into a single `modify_data_stream` request. Either all succeed or none do — no partial-failure window between data streams. The function retries up to 3 times with idempotency checks — it re-fetches current membership before each attempt so partially applied changes from a previous failed attempt are handled correctly.
 
-## 12. Test Suite
+## 12. Unit Test Suite
 
-67 unit tests across 6 files, running in ~0.6s with no cluster dependency:
+92 unit tests across 7 files, running in ~0.8s with no cluster dependency:
 
 - `test_job.py` — State machine transitions (every valid path, every invalid path, terminal states, error storage, serialization round-trips using `dataclasses.asdict`)
 - `test_index_info.py` — `needs_reindex`, `shard_reduction`, `store_size_mb` properties
-- `test_merge_analyzer.py` — Index grouping at monthly/quarterly granularity, single-index exclusion, shard reduction calculation, mapping union with field drift and type conflicts. `TestMergeGroupFromJob` covers `from_job_record()` round-trips for both naming formats, fallback without enriched metadata, yearly buckets, and empty source indices.
-- `test_preflight.py` — Cluster health gates (red/yellow/green, relocating, initializing), circuit breaker threshold detection with mocked ES client
+- `test_merge_analyzer.py` — Index grouping at monthly/quarterly granularity, single-index exclusion, shard reduction calculation, mapping union with field drift and type conflicts. `TestMergeGroupFromJob` covers `from_job_record()` round-trips for both naming formats, fallback without enriched metadata, yearly buckets, and empty source indices. Analysis settings conflict detection and union.
+- `test_preflight.py` — Cluster health gates (red/yellow/green, relocating, initializing). Circuit breaker backpressure: `_get_hot_breakers` scanning (empty, single hot, multi-node, zero limit, custom threshold), `check_circuit_breakers` wait-then-clear and wait-then-fail with mocked time, `check_circuit_breakers_instant` no-sleep guarantee, `_check_cluster_pressure` breaker integration at 75% threshold, `wait_for_cluster_ready` zero-delay on healthy clusters and wait-then-clear with mocked sleep.
 - `test_defrag_widget.py` — Per-shard cell creation, group mapping, state updates with sweep queuing, completion collapse (target cells green, excess cells freed), failed state handling, progress tracking, paint rendering, reset, and edge cases
 - `test_sizing.py` — Size tier classification, tier profile lookup, sort ordering (smallest-first/largest-first/as-is), priority queuing, dynamic batch sizing by disk budget
+- `test_snapshotter.py` — Force merge deduplication with exact bracket matching
 
-## 13. Elasticsearch API Surface
+## 13. End-to-End Test Suite
+
+A separate `sharderator-test-suite/` package provides end-to-end validation against a real Elastic Cloud trial deployment. It is intentionally kept in its own directory and package namespace (`sharderator_test`) to avoid co-mingling with the main Sharderator codebase.
+
+### Architecture
+
+The test suite is a Click CLI (`sharderator-test`) with subcommands for each phase of the test lifecycle:
+
+| Command | Purpose |
+|---------|---------|
+| `setup` | Create ILM policies, index templates, speed up ILM poll interval |
+| `ingest-oversharded` | Generate Scenario A data (over-sharded data streams) |
+| `ingest-daily` | Generate Scenario B data (daily index explosion) |
+| `status` | Show frozen shard budget and ILM progress |
+| `validate` | Run validation phases against the cluster |
+| `cleanup` | Remove all test artifacts |
+| `create-api-key` | Create a test API key with full cluster access |
+
+### Test Scenarios
+
+**Scenario A — Over-sharded indices:** Five data streams with 10/20/50 primary shards each, pushed to frozen via ILM with `max_age: 1m` rollover. After rollover, the old backing indices (with their high shard counts) move to frozen within ~3 minutes. This exercises Sharderator's shrink mode.
+
+**Scenario B — Daily index explosion:** N days x 40 metric types, each a single-shard index pushed to frozen via ILM. This exercises Sharderator's merge mode (monthly granularity consolidation).
+
+### Validation Phases
+
+| Phase | What it tests |
+|-------|--------------|
+| `read-only` | `sharderator-cli list`, `list --json`, `status` |
+| `dry-run` | Shrink and merge dry runs in both table and JSON format |
+| `shrink` | Single index shrink + batch shrink with doc count verification |
+| `merge` | Single group merge + full batch merge |
+| `crash-recovery` | Start merge, kill after 15s, check tracker, resume |
+| `export` | Frozen index CSV, job history JSON, merge plan JSON |
+
+The `validate` command shells out to `sharderator-cli` as a subprocess, capturing stdout/stderr and parsing JSON output. This tests the full CLI path end-to-end, including argument parsing, connection handling, and output formatting.
+
+### Platform Considerations
+
+- Windows `cp1252` console encoding: subprocess calls inject `PYTHONIOENCODING=utf-8` to handle the block characters in the terminal defrag visualization
+- Elastic Cloud trial clusters have a 1,000 frozen shard limit (not the 3,000 default)
+- Tiebreaker nodes routinely trip the 80% circuit breaker threshold — validation phases pass `--ignore-circuit-breakers` to `sharderator-cli`
+- `cat.indices()` in elasticsearch-py 8.x/9.x doesn't accept `ignore_unavailable` — uses `expand_wildcards="all"` with try/except instead
+- `max_shards_per_node` in cluster settings can be a plain string or a dict with a `frozen` key depending on ES version/config
+- Data streams require `_op_type: "create"` in bulk actions
+- Dotted field names in `_source` (e.g., `host.name`) don't match nested object mappings — ingest uses actual nested dicts
+
+## 14. Elasticsearch API Surface
 
 | Operation | API | Notes |
 |-----------|-----|-------|
 | Cluster health | `GET /_cluster/health` | Pre-flight + mid-operation |
-| Circuit breakers | `GET /_nodes/stats/breaker` | Pre-flight |
+| Circuit breakers | `GET /_nodes/stats/breaker` | Pre-flight gate + mid-operation pressure |
 | Thread pool stats | `GET /_nodes/stats/thread_pool` | Mid-operation pressure check |
 | JVM heap stats | `GET /_nodes/stats/jvm` | Mid-operation pressure check |
 | Pending tasks | `GET /_cluster/pending_tasks` | Mid-operation pressure check |
@@ -337,34 +426,23 @@ For merge mode, `_atomic_swap_multi_ds` collapses all add/remove actions across 
 | Cluster settings | `GET /_cluster/settings?include_defaults=true` | Frozen shard limit |
 | Tracker index | `sharderator-tracker` | Job persistence (index/get/delete/search) |
 
-## 14. Dependencies
+## 15. Dependencies
 
 | Package | Version | Purpose |
 |---------|---------|---------|
 | elasticsearch | >= 8.12 | Elasticsearch Python client |
-| es_client | >= 8.14 | Connection configuration helper |
 | pyyaml | >= 6.0 | Config file persistence |
 | keyring | >= 25.0 | Secure credential storage |
 | structlog | >= 24.0 | Structured logging |
 | PyQt6 | >= 6.6 | GUI framework (optional, `[gui]` extra) |
 
+Test suite additional dependencies:
+| Package | Version | Purpose |
+|---------|---------|---------|
+| click | >= 8.1 | CLI framework for test harness |
+| rich | >= 13.0 | Console formatting |
+
 Python >= 3.10 required.
-
-## 15. Job Tracker Viewer
-
-The third tab in the main window queries the `sharderator-tracker` Elasticsearch index and displays all tracked jobs in a table: index name, job type (SHRINK/MERGE), current state, error message, timestamps, and expected doc count. Rows are color-coded by state — red for FAILED, yellow for AWAITING_* states.
-
-A right-click context menu provides Resume (re-queues the job from its last committed state), Delete (removes the tracker document), Copy Error (clipboard), and View History (popup dialog showing the full state transition timeline with timestamps).
-
-**Resume for SHRINK jobs:** Creates a minimal `IndexInfo` from the job record and passes it to `Orchestrator.run()`. The orchestrator calls `load_job()` internally and resumes from the last committed state.
-
-**Resume for MERGE jobs:** Calls `MergeGroup.from_job_record(job)` to reconstruct the `MergeGroup` from the persisted `enriched_metadata` field. If `enriched_metadata` is populated (all jobs since v0.2.0), full `IndexInfo` objects are rebuilt. If it's empty (very old job records), falls back to minimal `IndexInfo` from `source_frozen_indices` names. The reconstructed group is passed to `MergeOrchestrator.run()`, which calls `load_job()` and resumes from the last committed state.
-
-`_parse_merged_name()` in `merge_analyzer.py` extracts `base_pattern` and `time_bucket` from the merged index name. Handles both the final frozen mount format (`partial-.ds-{base}-{bucket}-merged`) and the intermediate working name format (`sharderator-merged-{base}-{bucket}`).
-
-The Refresh button in the toolbar (also bound to F5) reloads cluster metadata, the frozen index list, and the tracker tab in a single action. It also fires automatically after every batch completion via `_on_batch_done`, so the toolbar shard count and index table update live without requiring a manual disconnect/reconnect cycle.
-
-The tracker query uses `list_all_jobs()` which searches the tracker index sorted by `updated_at` descending, limited to 500 documents. JSON blob fields (enriched_metadata, mappings, settings) are deserialized on load. If the tracker index doesn't exist yet, the viewer shows an empty table with a helpful message.
 
 ## 16. Scale Improvements
 
@@ -386,7 +464,7 @@ Indices are classified into four tiers based on store size. Each tier has a `Tie
 
 ### Deeper Health Checks
 
-`check_cluster_health_mid_operation()` now checks thread pool queue depths, pending cluster tasks, JVM heap pressure, and relocating/initializing shards on every stage transition. Uses linear backoff when pressure is detected.
+`check_cluster_health_mid_operation()` checks thread pool queue depths, pending cluster tasks, JVM heap pressure, circuit breaker ratios, and relocating/initializing shards on every stage transition. Uses linear backoff when pressure is detected.
 
 ### Size-Based Ordering
 
@@ -396,7 +474,7 @@ Indices are classified into four tiers based on store size. Each tier has a `Tie
 
 `prioritize_groups()` in `sizing.py` moves groups matching priority patterns to the front of the queue. Available via `--priority` CLI flag.
 
-## 16. Export Feature
+## 17. Export Feature
 
 Three export types for change ticket documentation and operational record-keeping.
 
@@ -406,13 +484,23 @@ Three export types for change ticket documentation and operational record-keepin
 
 **Job history** — The Job Tracker tab has an Export button that saves all tracked jobs as JSON with cluster name and timestamp. Right-click any row → "Export Job" saves a single job record. CLI: `sharderator-cli report` (all jobs), `sharderator-cli report --index <name>` (single job), `sharderator-cli report --state COMPLETED|FAILED|all` (filtered).
 
-The `report` subcommand queries the `sharderator-tracker` index and outputs JSON with `default=str` to handle any float timestamps or enum values.
+## 18. Job Tracker Viewer
 
-## 17. Known Limitations
+The third tab in the main window queries the `sharderator-tracker` Elasticsearch index and displays all tracked jobs in a table: index name, job type (SHRINK/MERGE), current state, error message, timestamps, and expected doc count. Rows are color-coded by state — red for FAILED, yellow for AWAITING_* states.
+
+A right-click context menu provides Resume (re-queues the job from its last committed state), Delete (removes the tracker document), Copy Error (clipboard), and View History (popup dialog showing the full state transition timeline with timestamps).
+
+**Resume for SHRINK jobs:** Creates a minimal `IndexInfo` from the job record and passes it to `Orchestrator.run()`. The orchestrator calls `load_job()` internally and resumes from the last committed state.
+
+**Resume for MERGE jobs:** Calls `MergeGroup.from_job_record(job)` to reconstruct the `MergeGroup` from the persisted `enriched_metadata` field. If `enriched_metadata` is populated, full `IndexInfo` objects are rebuilt. If it's empty (very old job records), falls back to minimal `IndexInfo` from `source_frozen_indices` names. The reconstructed group is passed to `MergeOrchestrator.run()`, which calls `load_job()` and resumes from the last committed state.
+
+`_parse_merged_name()` in `merge_analyzer.py` extracts `base_pattern` and `time_bucket` from the merged index name. Handles both the final frozen mount format (`partial-.ds-{base}-{bucket}-merged`) and the intermediate working name format (`sharderator-merged-{base}-{bucket}`).
+
+## 19. Known Limitations
 
 - Cross-index merge (combining indices from different base patterns) is not supported. Each merge group must share a base pattern.
 - The tool assumes standard Elastic naming conventions (`partial-`, `.ds-`, generation numbers). Indices with non-standard names may not be detected by the merge analyzer.
 - Minimum ES version 8.7 is required. Some features (like the Health Report API) work better on 8.12+.
 - No multi-cluster support — one connection at a time.
 - The CLI requires the same Python package as the GUI but not PyQt6. The `[gui]` extra adds PyQt6 for the GUI entry point.
-- Merge job resume from the GUI Tracker tab requires re-running the merge group from the Merge Mode tab (the tracker resume button handles shrink jobs only).
+- Cancellation during a backpressure wait (`time.sleep`) is not immediate — the current sleep interval must complete before the cancellation is detected at the next `_check_cancel`. Maximum unresponsive window is 300s (the sleep cap).
