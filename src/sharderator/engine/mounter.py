@@ -25,7 +25,12 @@ def remount(
     """Mount the new snapshot as a partially mounted (frozen) index. Returns new index name."""
     job.transition(JobState.REMOUNTING)
 
-    temp_mount_name = f"sharderator-new-{info.original_index_name}"
+    temp_mount_name = f"partial-sharderator-{info.original_index_name}"
+
+    # Clean up stale mount from a previous failed run
+    if client.indices.exists(index=temp_mount_name):
+        log.warning("mount_exists_deleting", index=temp_mount_name)
+        client.indices.delete(index=temp_mount_name)
 
     log.info("remounting", snapshot=snap_name, as_index=temp_mount_name)
 
@@ -71,6 +76,11 @@ def remount_merged(
     job.transition(JobState.REMOUNTING)
 
     log.info("remounting_merged", snapshot=snap_name, as_index=final_name)
+
+    # Clean up stale mount from a previous failed run
+    if client.indices.exists(index=final_name):
+        log.warning("mount_exists_deleting", index=final_name)
+        client.indices.delete(index=final_name)
 
     client.searchable_snapshots.mount(
         repository=repo,

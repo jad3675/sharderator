@@ -67,7 +67,23 @@ class ShrinkWorkerThread(QThread):
             events.failed.connect(self.failed)
 
     def run(self) -> None:
-        for info in self._indices:
+        from sharderator.engine.preflight import wait_for_cluster_ready
+
+        cfg = self._orchestrator._config
+        client = self._orchestrator._client
+
+        for i, info in enumerate(self._indices):
+            if i > 0:
+                try:
+                    self.log_message.emit("Checking cluster readiness...")
+                    wait_for_cluster_ready(
+                        client,
+                        allow_yellow=cfg.allow_yellow_cluster,
+                        ignore_circuit_breakers=cfg.ignore_circuit_breakers,
+                        wait_timeout_minutes=cfg.batch_backpressure_timeout_minutes,
+                    )
+                except Exception as e:
+                    self.log_message.emit(f"⚠ Cluster readiness check: {e}")
             self._orchestrator.run(info)
         self.batch_done.emit()
 
@@ -95,10 +111,26 @@ class MergeWorkerThread(QThread):
             events.failed.connect(self.failed)
 
     def run(self) -> None:
+        from sharderator.engine.preflight import wait_for_cluster_ready
+
+        cfg = self._orchestrator._config
+        client = self._orchestrator._client
         total = len(self._groups)
-        for i, group in enumerate(self._groups, 1):
+
+        for i, group in enumerate(self._groups):
+            if i > 0:
+                try:
+                    self.log_message.emit("Checking cluster readiness...")
+                    wait_for_cluster_ready(
+                        client,
+                        allow_yellow=cfg.allow_yellow_cluster,
+                        ignore_circuit_breakers=cfg.ignore_circuit_breakers,
+                        wait_timeout_minutes=cfg.batch_backpressure_timeout_minutes,
+                    )
+                except Exception as e:
+                    self.log_message.emit(f"⚠ Cluster readiness check: {e}")
             self.log_message.emit(
-                f"=== Merge group {i}/{total}: {group.base_pattern}/{group.time_bucket} "
+                f"=== Merge group {i + 1}/{total}: {group.base_pattern}/{group.time_bucket} "
                 f"({len(group.source_indices)} indices) ==="
             )
             self._orchestrator.run(group)

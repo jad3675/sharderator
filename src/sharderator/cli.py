@@ -12,7 +12,7 @@ from sharderator.client.connection import ClusterConnection
 from sharderator.client.queries import list_frozen_indices
 from sharderator.engine.events import PipelineEvents
 from sharderator.engine.merge_analyzer import propose_merges
-from sharderator.engine.preflight import run_dry_run_preflight
+from sharderator.engine.preflight import run_dry_run_preflight, wait_for_cluster_ready
 from sharderator.util.config import AppConfig, ConnectionConfig, OperationConfig
 from sharderator.util.logging import setup_logging, get_logger
 
@@ -277,6 +277,13 @@ def _cmd_shrink(conn: ClusterConnection, args) -> None:
     _setup_signal_handlers(orch)
     for idx, info in enumerate(indices, 1):
         print(f"\n[{idx}/{len(indices)}] {info.name} ({info.shard_count} shards)")
+        if idx > 1:
+            wait_for_cluster_ready(
+                conn.client,
+                allow_yellow=cfg.allow_yellow_cluster,
+                ignore_circuit_breakers=cfg.ignore_circuit_breakers,
+                wait_timeout_minutes=cfg.batch_backpressure_timeout_minutes,
+            )
         orch.run(info)
     print()
 
@@ -366,6 +373,13 @@ def _cmd_merge(conn: ClusterConnection, args) -> None:
     _setup_signal_handlers(orch)
     for idx, group in enumerate(groups, 1):
         print(f"\n[{idx}/{len(groups)}] {group.base_pattern}/{group.time_bucket} ({len(group.source_indices)} indices)")
+        if idx > 1:
+            wait_for_cluster_ready(
+                conn.client,
+                allow_yellow=cfg.allow_yellow_cluster,
+                ignore_circuit_breakers=cfg.ignore_circuit_breakers,
+                wait_timeout_minutes=cfg.batch_backpressure_timeout_minutes,
+            )
         orch.run(group)
     print()
 
@@ -421,6 +435,10 @@ def _add_operation_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--no-allow-yellow", action="store_false", dest="allow_yellow")
     g.add_argument("--delete-old-snapshots", action="store_true")
     g.add_argument("--ignore-circuit-breakers", action="store_true")
+    g.add_argument("--breaker-wait", type=int, default=10,
+                   help="Minutes to wait for circuit breaker pressure (0 = fail immediately)")
+    g.add_argument("--backpressure-wait", type=int, default=15,
+                   help="Minutes to wait between batch items under pressure (0 = no wait)")
 
 
 def _connect(args) -> ClusterConnection:
@@ -453,6 +471,8 @@ def _build_config(args) -> OperationConfig:
         allow_yellow_cluster=getattr(args, "allow_yellow", True),
         delete_old_snapshots=getattr(args, "delete_old_snapshots", False),
         ignore_circuit_breakers=getattr(args, "ignore_circuit_breakers", False),
+        circuit_breaker_wait_minutes=getattr(args, "breaker_wait", 10),
+        batch_backpressure_timeout_minutes=getattr(args, "backpressure_wait", 15),
     )
 
 

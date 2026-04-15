@@ -89,7 +89,7 @@ class Orchestrator:
         if job.state == JobState.PENDING:
             check_cluster_health(c, allow_yellow=cfg.allow_yellow_cluster)
             if not cfg.ignore_circuit_breakers:
-                check_circuit_breakers(c)
+                check_circuit_breakers(c, wait_timeout_minutes=cfg.circuit_breaker_wait_minutes)
             info = analyze(c, info, job)
             self._emit_state(info.name, job.state)
             _save()

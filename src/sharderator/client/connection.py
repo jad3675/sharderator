@@ -73,14 +73,26 @@ class ClusterConnection:
         health = self.client.cluster.health()
         self.cluster_health = health["status"]
 
-        # Discover frozen shard limit
-        settings = self.client.cluster.get_settings(include_defaults=True)
-        defaults = settings.get("defaults", {})
-        self.frozen_shard_limit = int(
-            defaults.get("cluster", {})
-            .get("max_shards_per_node", {})
-            .get("frozen", 3000)
-        )
+        # Discover frozen shard limit.
+        # max_shards_per_node can be a plain string (general limit) or a dict
+        # with a "frozen" key (explicit frozen limit), depending on ES version
+        # and whether the setting has been explicitly configured.
+        self.frozen_shard_limit = 3000
+        try:
+            settings = self.client.cluster.get_settings(include_defaults=True)
+            for scope in ("transient", "persistent", "defaults"):
+                scope_data = settings.get(scope, {})
+                msn = scope_data.get("cluster", {}).get("max_shards_per_node", {})
+                if isinstance(msn, dict):
+                    val = msn.get("frozen")
+                    if val is not None:
+                        self.frozen_shard_limit = int(val)
+                        break
+                elif isinstance(msn, str) and msn:
+                    self.frozen_shard_limit = int(msn)
+                    break
+        except Exception:
+            pass
 
         self._count_frozen_shards()
 

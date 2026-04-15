@@ -93,7 +93,7 @@ class MergeOrchestrator:
         if job.state == JobState.PENDING:
             check_cluster_health(c, allow_yellow=cfg.allow_yellow_cluster)
             if not cfg.ignore_circuit_breakers:
-                check_circuit_breakers(c)
+                check_circuit_breakers(c, wait_timeout_minutes=cfg.circuit_breaker_wait_minutes)
             enriched = analyze_merge_group(c, group, job)
             self._emit_state(job_name, job.state)
             _save()

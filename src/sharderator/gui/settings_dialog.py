@@ -95,6 +95,26 @@ class SettingsDialog(QDialog):
         self._ignore_breakers.setChecked(self._config.ignore_circuit_breakers)
         safety_form.addRow(self._ignore_breakers)
 
+        self._breaker_wait = QSpinBox()
+        self._breaker_wait.setRange(0, 60)
+        self._breaker_wait.setSuffix(" min")
+        self._breaker_wait.setValue(self._config.circuit_breaker_wait_minutes)
+        self._breaker_wait.setToolTip(
+            "How long to wait for circuit breaker pressure to subside "
+            "before failing an index. 0 = fail immediately (old behavior)."
+        )
+        safety_form.addRow("Circuit breaker wait:", self._breaker_wait)
+
+        self._backpressure_wait = QSpinBox()
+        self._backpressure_wait.setRange(0, 60)
+        self._backpressure_wait.setSuffix(" min")
+        self._backpressure_wait.setValue(self._config.batch_backpressure_timeout_minutes)
+        self._backpressure_wait.setToolTip(
+            "How long to pause between batch items if the cluster is under "
+            "pressure. 0 = no inter-index waiting."
+        )
+        safety_form.addRow("Batch backpressure wait:", self._backpressure_wait)
+
         layout.addWidget(safety)
 
         buttons = QDialogButtonBox(
@@ -117,4 +137,6 @@ class SettingsDialog(QDialog):
             reindex_requests_per_second=self._reindex_throttle.value(),
             allow_yellow_cluster=self._allow_yellow.isChecked(),
             ignore_circuit_breakers=self._ignore_breakers.isChecked(),
+            circuit_breaker_wait_minutes=self._breaker_wait.value(),
+            batch_backpressure_timeout_minutes=self._backpressure_wait.value(),
         )

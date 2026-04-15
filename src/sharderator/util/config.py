@@ -37,6 +37,8 @@ class OperationConfig:
     reindex_requests_per_second: float = 5000.0
     allow_yellow_cluster: bool = True
     ignore_circuit_breakers: bool = False
+    circuit_breaker_wait_minutes: int = 10
+    batch_backpressure_timeout_minutes: int = 15
 
 
 @dataclass
