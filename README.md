@@ -4,7 +4,7 @@ A PyQt6 GUI tool (with a headless CLI) for consolidating frozen-tier indices in 
 
 ## The Problem
 
-Elastic Cloud enforces a hard ceiling of 3,000 shards per frozen data node (`cluster.max_shards_per_node.frozen`). Frozen indices are partially mounted searchable snapshots — read-only by design. You can't shrink, reindex, or forcemerge them in place.
+Elastic Cloud enforces a hard ceiling on shards per frozen data node (`cluster.max_shards_per_node.frozen` — 3,000 default, 1,000 on trial clusters). Frozen indices are partially mounted searchable snapshots — read-only by design. You can't shrink, reindex, or forcemerge them in place.
 
 Two common patterns eat through the budget:
 
@@ -32,7 +32,7 @@ pip install sharderator
 Or from source:
 
 ```bash
-cd sharderator
+cd es-shard-defrag
 pip install -e ".[gui]"   # GUI + CLI
 pip install -e .           # CLI only
 ```
@@ -122,14 +122,21 @@ Sharderator is designed to run against production clusters with live traffic.
 
 **Pre-flight checks (run before every operation and during dry runs):**
 - Cluster health gate — blocks on red, configurable on yellow
-- Circuit breaker check — blocks if any breaker is above 80% capacity (overridable)
+- Circuit breaker check — waits with adaptive backoff if any breaker is above 80% capacity (configurable timeout, overridable)
 - Disk space gate — refuses to restore if working tier would drop below safety margin (default 30% free)
+
+**Circuit breaker adaptive backpressure:**
+- The per-index preflight gate (`check_circuit_breakers`) now waits with linear backoff (30s→60s→90s… capped at 300s) instead of failing instantly. Configurable via `--breaker-wait` (default 10 minutes, 0 = fail-fast)
+- Mid-operation pressure checks include circuit breaker ratios at a 75% threshold — 5 points below the hard gate — so pauses kick in before the next index's preflight would reject
+- Between batch items, `wait_for_cluster_ready` combines health + breaker + pressure checks with adaptive waiting. Configurable via `--backpressure-wait` (default 15 minutes, 0 = no inter-index waiting)
+- If all checks pass immediately, there is zero overhead — no artificial delay on healthy clusters
 
 **Mid-operation monitoring (checked between every pipeline stage):**
 - Cluster health — if cluster goes red, pauses up to 15 minutes waiting for recovery
+- Circuit breaker ratios — pauses if any breaker exceeds 75%
 - Thread pool queue depths (write, search, snapshot) — warns and backs off if queues are deep
 - Pending cluster tasks — warns if master node is saturated
-- JVM heap pressure — warns if any working tier node is above 85% heap
+- JVM heap pressure — warns if any working tier node is above 85%
 
 **Data integrity:**
 - Data stream swaps happen AFTER verification — if doc count or mapping checks fail, the data stream still points at the old (working) index
@@ -144,6 +151,8 @@ Sharderator is designed to run against production clusters with live traffic.
 - Continuous disk monitoring — rechecks disk before each restore batch and before reindex
 - Thread-safe cancellation using `threading.Event`
 - Graceful shutdown — closing the GUI during a running pipeline prompts for confirmation, persists job state for resume
+- Orphaned intermediate index cleanup — restorer and shrinker detect and remove stale `sharderator-restore-*` and `sharderator-shrunk-*` indices from previous failed runs
+- Mount name collision handling — `remount()` and `remount_merged()` check for and delete stale mounts before mounting
 
 **Adaptive timeouts by index size:**
 
@@ -209,6 +218,8 @@ Available in both GUI dry runs and CLI `--dry-run`.
 | Reindex throttle | 5000 docs/sec | Rate limit (-1 = unlimited; tier profile may reduce) |
 | Allow yellow cluster | On | Permit operations when cluster health is yellow |
 | Ignore circuit breakers | Off | Override circuit breaker safety check |
+| Circuit breaker wait | 10 min | How long to wait for breaker pressure to subside (0 = fail immediately) |
+| Batch backpressure wait | 15 min | How long to pause between batch items under pressure (0 = no wait) |
 
 Settings persist to `~/.sharderator/config.yaml`. Credentials stored via OS keyring.
 
@@ -233,6 +244,10 @@ Settings persist to `~/.sharderator/config.yaml`. Credentials stored via OS keyr
 | `--max-indices` | 0 (all) | Limit number of indices |
 | `--order` | smallest-first | `smallest-first`, `largest-first`, `as-is` |
 | `--dry-run` | — | Preflight checks + sizing report only |
+| `--output` | table | `table` or `json` (dry-run format) |
+| `--breaker-wait` | 10 | Minutes to wait for circuit breaker pressure (0 = fail immediately) |
+| `--backpressure-wait` | 15 | Minutes to wait between batch items under pressure (0 = no wait) |
+| `--ignore-circuit-breakers` | — | Skip circuit breaker checks entirely |
 
 ### `sharderator-cli merge`
 
@@ -244,6 +259,17 @@ Settings persist to `~/.sharderator/config.yaml`. Credentials stored via OS keyr
 | `--order` | smallest-first | `smallest-first`, `largest-first`, `as-is` |
 | `--priority` | — | Comma-separated patterns to process first |
 | `--dry-run` | — | Preflight checks + sizing report only |
+| `--output` | table | `table` or `json` (dry-run format) |
+| `--breaker-wait` | 10 | Minutes to wait for circuit breaker pressure (0 = fail immediately) |
+| `--backpressure-wait` | 15 | Minutes to wait between batch items under pressure (0 = no wait) |
+| `--ignore-circuit-breakers` | — | Skip circuit breaker checks entirely |
+
+### `sharderator-cli report`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--index` | — | Specific job by index name |
+| `--state` | all | `COMPLETED`, `FAILED`, or `all` |
 
 ## Data Stream Handling
 
@@ -253,63 +279,104 @@ Both modes handle data stream backing indices:
 - Merge mode: atomic swap of all source backing indices in a single `_data_stream/_modify` call
 - Verifies each source is still a data stream member before attempting removal
 
+## End-to-End Test Suite
+
+A separate `sharderator-test-suite/` package provides end-to-end validation against a real Elastic Cloud trial deployment. It creates two realistic frozen-tier shard pressure scenarios and runs Sharderator's shrink and merge modes against them.
+
+See [`sharderator-test-suite/README.md`](../sharderator-test-suite/README.md) for full documentation.
+
+```bash
+cd sharderator-test-suite
+pip install -e .
+
+# Configure cluster, ingest test data, watch ILM freeze it
+sharderator-test setup
+sharderator-test ingest-oversharded
+sharderator-test ingest-daily --days 7
+sharderator-test status --watch
+
+# Run validation phases
+sharderator-test validate --phase read-only
+sharderator-test validate --phase dry-run
+sharderator-test validate --phase shrink
+sharderator-test validate --phase merge
+sharderator-test validate --phase export
+```
+
+**Scenarios:**
+- **Scenario A** — Over-sharded data streams (10/20/50 primary shards) pushed to frozen via ILM with `max_age: 1m` rollover
+- **Scenario B** — Daily index explosion (N days × 40 metric types) creating single-shard indices
+
+**Validation phases:** read-only (list/status), dry-run (shrink + merge JSON export), shrink (single + batch), merge (single group + batch), crash-recovery (interrupt + resume), export (CSV/JSON).
+
 ## Project Structure
 
 ```
-sharderator/
+es-shard-defrag/                      # Main Sharderator package
+├── pyproject.toml
+├── tests/
+│   ├── test_job.py                   # State machine + serialization
+│   ├── test_index_info.py            # IndexInfo properties
+│   ├── test_merge_analyzer.py        # Grouping + mapping union
+│   ├── test_preflight.py             # Health gates + circuit breaker backpressure
+│   ├── test_defrag_widget.py         # Defrag visualization
+│   ├── test_sizing.py                # Size tiers + ordering + batching
+│   └── test_snapshotter.py           # Force merge deduplication
+└── src/sharderator/
+    ├── __main__.py                   # GUI entry point
+    ├── cli.py                        # CLI entry point (no PyQt6 required)
+    ├── gui/
+    │   ├── main_window.py            # Main window (Shrink/Merge/Tracker tabs)
+    │   ├── defrag_widget.py          # Per-shard cell grid visualization
+    │   ├── qt_events.py              # Qt signal adapter for PipelineEvents
+    │   ├── connection_dialog.py      # Auth configuration
+    │   ├── settings_dialog.py        # Operation + safety settings
+    │   ├── confirm_dialog.py         # Shrink + merge confirmation popups
+    │   ├── index_table.py            # Frozen index table model/view
+    │   ├── merge_tree.py             # Merge candidate tree with lazy validation
+    │   ├── tracker_table.py          # Job tracker table + context menu
+    │   ├── job_history_dialog.py     # State transition timeline popup
+    │   ├── job_log.py                # Log viewer
+    │   └── progress.py               # Progress bar
+    ├── engine/
+    │   ├── orchestrator.py           # Shrink pipeline state machine
+    │   ├── merge_orchestrator.py     # Merge pipeline state machine
+    │   ├── events.py                 # PipelineEvents protocol + NullEvents
+    │   ├── preflight.py              # Health + disk + breaker checks + backpressure
+    │   ├── sizing.py                 # Size tiers, ordering, dynamic batching, reports
+    │   ├── task_waiter.py            # Shared async task polling
+    │   ├── analyzer.py               # Index analysis
+    │   ├── restorer.py               # Snapshot restore + disk gate
+    │   ├── shrinker.py               # Shrink API + async reindex fallback
+    │   ├── merger.py                 # Multi-source batched restore + reindex
+    │   ├── merge_analyzer.py         # Index grouping + validation
+    │   ├── snapshotter.py            # Force-merge (with dedup) + snapshot
+    │   ├── mounter.py                # Frozen re-mount (mount only, no DS swap)
+    │   ├── swapper.py                # Atomic data stream swap with retry
+    │   ├── verifier.py               # Doc count + mapping + health checks
+    │   └── cleaner.py                # Cleanup with cold-tier mount checks
+    ├── client/
+    │   ├── connection.py             # ES client + cluster discovery
+    │   ├── queries.py                # Reusable queries + DS membership cache
+    │   └── tracker.py                # Job persistence to ES tracking index
+    ├── models/
+    │   ├── index_info.py             # Index metadata dataclass
+    │   └── job.py                    # Job state machine + type discriminator
+    └── util/
+        ├── logging.py                # Structured logging (structlog)
+        └── config.py                 # YAML config + keyring secrets
+
+sharderator-test-suite/               # End-to-end test harness (separate package)
 ├── pyproject.toml
 ├── README.md
-├── technical-design.md
-├── tests/
-│   ├── test_job.py               # State machine + serialization
-│   ├── test_index_info.py        # IndexInfo properties
-│   ├── test_merge_analyzer.py    # Grouping + mapping union
-│   ├── test_preflight.py         # Cluster health + breaker checks
-│   ├── test_defrag_widget.py     # Defrag visualization
-│   └── test_sizing.py            # Size tiers + ordering + batching
-└── src/sharderator/
-    ├── __main__.py               # GUI entry point
-    ├── cli.py                    # CLI entry point (no PyQt6 required)
-    ├── gui/
-    │   ├── main_window.py        # Main window (Shrink/Merge/Tracker tabs)
-    │   ├── defrag_widget.py      # Per-shard cell grid visualization
-    │   ├── qt_events.py          # Qt signal adapter for PipelineEvents
-    │   ├── connection_dialog.py  # Auth configuration
-    │   ├── settings_dialog.py    # Operation + safety settings
-    │   ├── confirm_dialog.py     # Shrink + merge confirmation popups
-    │   ├── index_table.py        # Frozen index table model/view
-    │   ├── merge_tree.py         # Merge candidate tree with lazy validation
-    │   ├── tracker_table.py      # Job tracker table + context menu
-    │   ├── job_history_dialog.py # State transition timeline popup
-    │   ├── job_log.py            # Log viewer
-    │   └── progress.py           # Progress bar
-    ├── engine/
-    │   ├── orchestrator.py       # Shrink pipeline state machine
-    │   ├── merge_orchestrator.py # Merge pipeline state machine
-    │   ├── events.py             # PipelineEvents protocol + NullEvents
-    │   ├── preflight.py          # Cluster health + disk + breaker checks
-    │   ├── sizing.py             # Size tiers, ordering, dynamic batching, sizing reports
-    │   ├── task_waiter.py        # Shared async task polling
-    │   ├── analyzer.py           # Index analysis
-    │   ├── restorer.py           # Snapshot restore + disk gate
-    │   ├── shrinker.py           # Shrink API + async reindex fallback
-    │   ├── merger.py             # Multi-source batched restore + reindex
-    │   ├── merge_analyzer.py     # Index grouping + validation
-    │   ├── snapshotter.py        # Force-merge (with dedup) + snapshot
-    │   ├── mounter.py            # Frozen re-mount (mount only, no DS swap)
-    │   ├── swapper.py            # Atomic data stream swap with retry
-    │   ├── verifier.py           # Doc count + mapping + health checks
-    │   └── cleaner.py            # Cleanup with cold-tier mount checks
-    ├── client/
-    │   ├── connection.py         # ES client + cluster discovery
-    │   ├── queries.py            # Reusable queries + DS membership cache
-    │   └── tracker.py            # Job persistence to ES tracking index
-    ├── models/
-    │   ├── index_info.py         # Index metadata dataclass
-    │   └── job.py                # Job state machine + type discriminator
-    └── util/
-        ├── logging.py            # Structured logging (structlog)
-        └── config.py             # YAML config + keyring secrets
+├── .env.example
+└── src/sharderator_test/
+    ├── cli.py                        # Click CLI (setup, ingest, status, validate, cleanup)
+    ├── connection.py                 # ES client factory with .env loading
+    ├── fixtures.py                   # ILM policies, index templates, cluster config
+    ├── ingest.py                     # Data generators (over-sharded + daily)
+    ├── status.py                     # Cluster status + ILM watch mode
+    └── validate.py                   # Validation phases (read-only, dry-run, shrink, merge, export)
 ```
 
 ## Troubleshooting
@@ -318,8 +385,11 @@ sharderator/
 - **"Cannot determine source snapshot"** — Index was manually mounted without `index.store.snapshot.*` metadata
 - **"InsufficientDiskError"** — Working tier doesn't have enough free space. Reduce batch size, process fewer groups, or add warm/hot capacity
 - **"ClusterNotHealthyError"** — Cluster is red, has too many relocating shards, or circuit breakers are tripped. Wait for the cluster to stabilize, or enable the override in Settings
+- **"sustained memory pressure" after waiting** — Circuit breakers stayed above 80% for the full wait timeout. Increase `--breaker-wait`, reduce batch size, or wait for the cluster to settle manually
 - **Recovery/reindex timeouts** — Increase the timeout in Settings, or ensure the working tier has adequate resources. Large indices (>50GB) automatically get longer timeouts via size tier profiles
 - **Merge dry run shows "BLOCKED — Circuit breaker..."** — Enable "Ignore circuit breakers" in Settings to override. The tiebreaker node often has a small heap that trips the 80% threshold
+- **Mount name collision on retry** — Handled automatically. `remount()` checks for and deletes stale mounts before mounting
+- **Frozen stats not available during verification** — `_wait_for_doc_count()` polls with a 60s timeout for frozen index stats to become available after mount
 
 ## License
 
