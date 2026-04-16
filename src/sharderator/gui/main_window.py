@@ -458,7 +458,7 @@ class MainWindow(QMainWindow):
                 self._frozen_indices,
                 frozen_limit=self._conn.frozen_shard_limit,
             )
-            self._analyze_widget.set_analysis(analysis)
+            self._analyze_widget.set_analysis(analysis, cluster_name=self._conn.cluster_name)
         else:
             self._analyze_widget.clear()
 
@@ -668,6 +668,7 @@ class MainWindow(QMainWindow):
         self._batch_completed: list[str] = []
         self._batch_failed: list[tuple[str, str]] = []
         self._batch_total: int = 0
+        self._batch_shards_before: int = self._conn.frozen_shard_count
 
         if isinstance(worker, ShrinkWorkerThread):
             self._batch_total = len(worker._indices)
@@ -747,7 +748,107 @@ class MainWindow(QMainWindow):
                 lines.append(f"  ... and {len(self._batch_failed) - 5} more (see job log)")
 
         msg = QMessageBox(icon, title, "\n".join(lines), QMessageBox.StandardButton.Ok, self)
+        save_btn = msg.addButton("Save Report", QMessageBox.ButtonRole.ActionRole)
         msg.exec()
+
+        if msg.clickedButton() == save_btn:
+            self._save_change_report()
+
+    def _save_change_report(self) -> None:
+        """Generate and save a post-operation change report."""
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Save Change Report",
+            f"sharderator-change-report.html",
+            "HTML Report (*.html);;JSON (*.json)",
+        )
+        if not path:
+            return
+
+        import json
+        import time as _time
+
+        mode = getattr(self, "_batch_mode", "Operation")
+        completed = self._batch_completed
+        failed = self._batch_failed
+        shards_before = getattr(self, "_batch_shards_before", 0)
+        shards_after = self._conn.frozen_shard_count
+        shards_saved = self._defrag._total_shards_saved
+        ts = _time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        cluster = self._conn.cluster_name
+
+        if path.endswith(".json") or "JSON" in selected_filter:
+            report = {
+                "report_type": "change_report",
+                "timestamp": ts,
+                "cluster": cluster,
+                "mode": mode,
+                "shards_before": shards_before,
+                "shards_after": shards_after,
+                "shards_reclaimed": shards_saved,
+                "frozen_limit": self._conn.frozen_shard_limit,
+                "total_items": self._batch_total,
+                "completed": completed,
+                "failed": [{"name": n, "error": e} for n, e in failed],
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+        else:
+            completed_rows = ""
+            for name in completed:
+                completed_rows += f"<tr><td>{name}</td><td style='color:#2e7d32'>✓ Completed</td></tr>\n"
+            failed_rows = ""
+            for name, error in failed:
+                short = error[:200] + "..." if len(error) > 200 else error
+                failed_rows += f"<tr><td>{name}</td><td style='color:#c62828'>✗ {short}</td></tr>\n"
+
+            pct_before = shards_before / self._conn.frozen_shard_limit * 100 if self._conn.frozen_shard_limit else 0
+            pct_after = shards_after / self._conn.frozen_shard_limit * 100 if self._conn.frozen_shard_limit else 0
+
+            html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Sharderator — Change Report</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         max-width: 960px; margin: 20px auto; color: #333; font-size: 14px; }}
+  h1 {{ color: #1a237e; border-bottom: 2px solid #1a237e; padding-bottom: 8px; }}
+  h2 {{ color: #283593; margin-top: 24px; }}
+  .meta {{ color: #666; font-size: 12px; margin-bottom: 16px; }}
+  .summary {{ display: flex; gap: 16px; margin: 16px 0; }}
+  .stat {{ flex: 1; border: 1px solid #ccc; border-radius: 6px; padding: 12px; text-align: center; }}
+  .stat .label {{ font-size: 12px; color: #666; }}
+  .stat .value {{ font-size: 24px; font-weight: bold; color: #1a237e; }}
+  .stat .sub {{ font-size: 11px; color: #888; }}
+  .good {{ color: #2e7d32 !important; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }}
+  th {{ background: #f5f5f5; text-align: left; padding: 6px 8px; border-bottom: 2px solid #ddd; }}
+  td {{ padding: 4px 8px; border-bottom: 1px solid #eee; }}
+  tr:nth-child(even) {{ background: #fafafa; }}
+  @media print {{ body {{ font-size: 11px; }} }}
+</style></head><body>
+<h1>Sharderator — {mode} Change Report</h1>
+<div class="meta">Cluster: {cluster} &nbsp;|&nbsp; Completed: {ts}</div>
+
+<div class="summary">
+  <div class="stat"><div class="label">Before</div><div class="value">{shards_before:,}</div><div class="sub">shards ({pct_before:.1f}%)</div></div>
+  <div class="stat"><div class="label">After</div><div class="value">{shards_after:,}</div><div class="sub">shards ({pct_after:.1f}%)</div></div>
+  <div class="stat"><div class="label">Reclaimed</div><div class="value good">{shards_saved:,}</div><div class="sub">shards freed</div></div>
+  <div class="stat"><div class="label">Result</div><div class="value">{len(completed)}/{self._batch_total}</div><div class="sub">{len(failed)} failed</div></div>
+</div>
+
+<h2>Completed ({len(completed)})</h2>
+<table>
+<tr><th>Index / Group</th><th>Status</th></tr>
+{completed_rows if completed_rows else '<tr><td colspan="2" style="color:#888">None</td></tr>'}
+</table>
+
+{"<h2>Failed (" + str(len(failed)) + ")</h2><table><tr><th>Index / Group</th><th>Error</th></tr>" + failed_rows + "</table>" if failed else ""}
+
+<div class="meta" style="margin-top:24px">Generated by Sharderator</div>
+</body></html>"""
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)
+
+        self._job_log.append_log(f"Change report saved to {path}")
 
     def _set_running(self, running: bool) -> None:
         self._btn_analyze.setEnabled(not running)

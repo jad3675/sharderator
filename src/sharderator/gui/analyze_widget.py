@@ -5,11 +5,13 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QProgressBar,
+    QPushButton,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -116,6 +118,10 @@ class AnalyzeWidget(QWidget):
         status_font.setBold(True)
         self._lbl_status.setFont(status_font)
         budget_row.addWidget(self._lbl_status)
+        self._btn_export = QPushButton("Export")
+        self._btn_export.setEnabled(False)
+        self._btn_export.clicked.connect(self._on_export)
+        budget_row.addWidget(self._btn_export)
         layout.addLayout(budget_row)
 
         # Summary cards row
@@ -193,9 +199,11 @@ class AnalyzeWidget(QWidget):
         item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return item
 
-    def set_analysis(self, analysis: FrozenAnalysis) -> None:
+    def set_analysis(self, analysis: FrozenAnalysis, cluster_name: str = "") -> None:
         """Populate the widget with analysis results."""
         self._analysis = analysis
+        self._cluster_name = cluster_name
+        self._btn_export.setEnabled(True)
 
         # Budget bar
         self._budget_bar.set_budget(analysis.total_shards, analysis.frozen_limit)
@@ -257,6 +265,8 @@ class AnalyzeWidget(QWidget):
 
     def clear(self) -> None:
         self._analysis = None
+        self._cluster_name = ""
+        self._btn_export.setEnabled(False)
         self._budget_bar.set_budget(0, 1)
         self._lbl_status.setText("")
         self._tbl_over_sharded.setRowCount(0)
@@ -264,3 +274,28 @@ class AnalyzeWidget(QWidget):
         self._lbl_recommendation.setText("Connect to a cluster and click Refresh to analyze.")
         for card in (self._card_over_sharded, self._card_mergeable, self._card_optimal, self._card_processed):
             card.set_detail("")
+
+    def _on_export(self) -> None:
+        if not self._analysis:
+            return
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Export Frozen Tier Analysis",
+            "sharderator-analysis.html",
+            "HTML Report (*.html);;JSON (*.json)",
+        )
+        if not path:
+            return
+
+        import json
+
+        if path.endswith(".json") or "JSON" in selected_filter:
+            import time as _time
+            data = self._analysis.to_dict()
+            data["cluster"] = self._cluster_name
+            data["timestamp"] = _time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        else:
+            html = self._analysis.format_html(cluster_name=self._cluster_name)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html)

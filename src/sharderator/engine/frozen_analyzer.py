@@ -170,6 +170,106 @@ class FrozenAnalysis:
 
         return "\n".join(lines)
 
+    def format_html(self, cluster_name: str = "", timestamp: str = "") -> str:
+        """Format as a self-contained HTML report suitable for printing to PDF."""
+        import time as _time
+        ts = timestamp or _time.strftime("%Y-%m-%d %H:%M:%S")
+        status = self.budget_status()
+        status_colors = {"OK": "#43a047", "WARNING": "#ffc107", "CRITICAL": "#ff9800", "OVER LIMIT": "#e53935"}
+        status_color = status_colors.get(status, "#888")
+        pct = min(self.budget_used_pct, 100)
+        total_reclaimable = self.shrink_savings + self.merge_monthly_savings
+
+        rows_over = ""
+        for i in self.over_sharded:
+            savings = i.shard_count - i.target_shard_count
+            rows_over += (
+                f"<tr><td>{i.name}</td><td class='r'>{i.shard_count}</td>"
+                f"<td class='r'>{i.target_shard_count}</td><td class='r'>{savings}</td>"
+                f"<td class='r'>{i.store_size_mb:.1f}</td></tr>\n"
+            )
+
+        rows_merge = ""
+        for p in self.mergeable_patterns:
+            rows_merge += (
+                f"<tr><td>{p.base_pattern}</td><td class='r'>{p.index_count}</td>"
+                f"<td class='r'>{p.total_shards}</td>"
+                f"<td class='r'>{p.shards_after_monthly_merge}</td>"
+                f"<td class='r'>{p.monthly_savings}</td>"
+                f"<td class='r'>{p.total_size_mb:.1f}</td></tr>\n"
+            )
+
+        after = self.total_shards - total_reclaimable
+        after_pct = after / self.frozen_limit * 100 if self.frozen_limit else 0
+
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Sharderator — Frozen Tier Analysis</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         max-width: 960px; margin: 20px auto; color: #333; font-size: 14px; }}
+  h1 {{ color: #1a237e; border-bottom: 2px solid #1a237e; padding-bottom: 8px; }}
+  h2 {{ color: #283593; margin-top: 24px; }}
+  .meta {{ color: #666; font-size: 12px; margin-bottom: 16px; }}
+  .budget-bar {{ background: #e0e0e0; border-radius: 6px; height: 32px; position: relative;
+                 margin: 12px 0; overflow: hidden; }}
+  .budget-fill {{ background: {status_color}; height: 100%; border-radius: 6px;
+                  width: {pct:.1f}%; min-width: 2px; }}
+  .budget-text {{ position: absolute; top: 0; left: 0; right: 0; height: 32px;
+                  line-height: 32px; text-align: center; font-weight: bold; color: #333; }}
+  .cards {{ display: flex; gap: 12px; margin: 16px 0; }}
+  .card {{ flex: 1; border: 1px solid #ccc; border-radius: 6px; padding: 12px;
+           text-align: center; }}
+  .card h3 {{ margin: 0 0 4px 0; font-size: 13px; color: #555; }}
+  .card .value {{ font-size: 18px; font-weight: bold; color: #1a237e; }}
+  .card .sub {{ font-size: 11px; color: #888; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }}
+  th {{ background: #f5f5f5; text-align: left; padding: 6px 8px; border-bottom: 2px solid #ddd; }}
+  td {{ padding: 4px 8px; border-bottom: 1px solid #eee; }}
+  tr:nth-child(even) {{ background: #fafafa; }}
+  .r {{ text-align: right; }}
+  .rec {{ background: #e8f5e9; border: 1px solid #a5d6a7; border-radius: 6px;
+          padding: 12px 16px; margin-top: 16px; }}
+  .rec b {{ color: #2e7d32; }}
+  @media print {{ body {{ font-size: 11px; }} .budget-bar {{ print-color-adjust: exact; -webkit-print-color-adjust: exact; }} }}
+</style></head><body>
+<h1>Sharderator — Frozen Tier Analysis</h1>
+<div class="meta">Cluster: {cluster_name or 'N/A'} &nbsp;|&nbsp; Generated: {ts}</div>
+
+<div class="budget-bar">
+  <div class="budget-fill"></div>
+  <div class="budget-text">{self.total_shards:,} / {self.frozen_limit:,} shards ({self.budget_used_pct:.1f}%) — {status}</div>
+</div>
+
+<div class="cards">
+  <div class="card"><h3>Over-Sharded</h3><div class="value">{len(self.over_sharded)}</div><div class="sub">{self.shrink_savings:,} shards reclaimable</div></div>
+  <div class="card"><h3>Mergeable</h3><div class="value">{len(self.mergeable_patterns)}</div><div class="sub">{self.merge_monthly_savings:,} shards reclaimable</div></div>
+  <div class="card"><h3>Already Optimal</h3><div class="value">{self.already_optimal}</div><div class="sub">1 shard each</div></div>
+  <div class="card"><h3>Processed</h3><div class="value">{self.already_sharderated + self.already_merged}</div><div class="sub">{self.already_sharderated} sharderated, {self.already_merged} merged</div></div>
+</div>
+
+<h2>Over-Sharded Indices ({len(self.over_sharded)})</h2>
+<table>
+<tr><th>Index Name</th><th class="r">Shards</th><th class="r">Target</th><th class="r">Savings</th><th class="r">Size (MB)</th></tr>
+{rows_over if rows_over else '<tr><td colspan="5" style="color:#888">None</td></tr>'}
+</table>
+
+<h2>Mergeable Patterns ({len(self.mergeable_patterns)})</h2>
+<table>
+<tr><th>Base Pattern</th><th class="r">Indices</th><th class="r">Shards</th><th class="r">→ Monthly</th><th class="r">Savings</th><th class="r">Size (MB)</th></tr>
+{rows_merge if rows_merge else '<tr><td colspan="6" style="color:#888">None</td></tr>'}
+</table>
+
+<div class="rec">
+  <b>{total_reclaimable:,} shards reclaimable</b><br>
+  Shrink: {self.shrink_savings:,} from {len(self.over_sharded)} indices &nbsp;|&nbsp;
+  Merge (monthly): {self.merge_monthly_savings:,} from {len(self.mergeable_patterns)} patterns<br>
+  Budget after: {after:,} / {self.frozen_limit:,} ({after_pct:.1f}%)
+</div>
+
+<div class="meta" style="margin-top:24px">Generated by Sharderator</div>
+</body></html>"""
+
 
 def analyze_frozen_tier(
     indices: list[IndexInfo],
