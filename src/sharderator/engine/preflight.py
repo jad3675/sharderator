@@ -10,6 +10,19 @@ from sharderator.util.logging import get_logger
 
 log = get_logger(__name__)
 
+# Roles that indicate a node participates in data operations (restore,
+# reindex, force-merge, snapshot). Nodes with only master/voting_only/ml
+# roles are excluded from pressure checks.
+_DATA_ROLES = frozenset({
+    "data", "data_hot", "data_warm", "data_cold", "data_frozen", "data_content",
+})
+
+
+def _is_data_node(node_data: dict) -> bool:
+    """Return True if the node has any data-tier role."""
+    roles = node_data.get("roles", [])
+    return bool(_DATA_ROLES.intersection(roles))
+
 
 class ClusterNotHealthyError(Exception):
     """Raised when the cluster is not in a safe state for operations."""
@@ -61,14 +74,20 @@ def _get_hot_breakers(
     client: Elasticsearch,
     threshold: float = 0.80,
 ) -> list[tuple[str, str, float]]:
-    """Scan all nodes for circuit breakers above the given threshold.
+    """Scan data nodes for circuit breakers above the given threshold.
+
+    Non-data nodes (master-only, tiebreaker, ML) are skipped — their
+    memory pressure is irrelevant to Sharderator's workload.
 
     Returns a list of (breaker_name, node_name, ratio) tuples.
     An empty list means all breakers are below threshold.
     """
     hot: list[tuple[str, str, float]] = []
-    nodes_stats = client.nodes.stats(metric="breaker")
+    nodes_stats = client.nodes.stats(metric="breaker,os")
     for node_id, node_data in nodes_stats.get("nodes", {}).items():
+        if not _is_data_node(node_data):
+            log.debug("skipping_non_data_node", node=node_data.get("name", node_id), roles=node_data.get("roles", []))
+            continue
         node_name = node_data.get("name", node_id)
         for breaker_name, breaker_data in node_data.get("breakers", {}).items():
             limit = breaker_data.get("limit_size_in_bytes", 0)
@@ -233,8 +252,11 @@ def _check_cluster_pressure(client: Elasticsearch) -> list[str]:
             issues.append(f"High pending cluster tasks: {task_count}")
 
         # Single call for both thread pool and JVM stats
-        stats = client.nodes.stats(metric="thread_pool,jvm")
+        stats = client.nodes.stats(metric="thread_pool,jvm,os")
         for node_id, node_data in stats.get("nodes", {}).items():
+            if not _is_data_node(node_data):
+                log.debug("skipping_non_data_node", node=node_data.get("name", node_id), roles=node_data.get("roles", []))
+                continue
             node_name = node_data.get("name", node_id)
 
             # Thread pool queue depths

@@ -7,6 +7,7 @@ import pytest
 from sharderator.engine.preflight import (
     ClusterNotHealthyError,
     _get_hot_breakers,
+    _is_data_node,
     check_circuit_breakers,
     check_circuit_breakers_instant,
     check_cluster_health,
@@ -26,15 +27,22 @@ def _mock_client(health_status="green", relocating=0, initializing=0, unassigned
     return client
 
 
-def _breaker_stats(breakers_by_node: dict[str, dict[str, tuple[int, int]]]):
-    """Build a nodes.stats(metric="breaker") response.
+def _breaker_stats(
+    breakers_by_node: dict[str, dict[str, tuple[int, int]]],
+    roles_by_node: dict[str, list[str]] | None = None,
+):
+    """Build a nodes.stats(metric="breaker,os") response.
 
     breakers_by_node: {node_name: {breaker_name: (limit, estimated)}}
+    roles_by_node: {node_name: [roles]}  — defaults to ["data_hot"] for all nodes
     """
+    if roles_by_node is None:
+        roles_by_node = {}
     nodes = {}
     for node_name, breakers in breakers_by_node.items():
         nodes[node_name] = {
             "name": node_name,
+            "roles": roles_by_node.get(node_name, ["data_hot"]),
             "breakers": {
                 name: {
                     "limit_size_in_bytes": limit,
@@ -206,12 +214,11 @@ class TestCheckClusterPressure:
             "relocating_shards": 0,
             "initializing_shards": 0,
         }
-        # nodes.stats is called twice: once for thread_pool,jvm and once for breaker
-        # via _get_hot_breakers. We need to handle both calls.
         tp_jvm_stats = {
             "nodes": {
                 "node1": {
                     "name": "node1",
+                    "roles": ["data_hot"],
                     "thread_pool": {"write": {"queue": 0}, "search": {"queue": 0}, "snapshot": {"queue": 0}},
                     "jvm": {"mem": {"heap_used_in_bytes": 500, "heap_max_in_bytes": 1000}},
                 }
@@ -237,6 +244,7 @@ class TestCheckClusterPressure:
             "nodes": {
                 "node1": {
                     "name": "node1",
+                    "roles": ["data_hot"],
                     "thread_pool": {"write": {"queue": 0}, "search": {"queue": 0}, "snapshot": {"queue": 0}},
                     "jvm": {"mem": {"heap_used_in_bytes": 500, "heap_max_in_bytes": 1000}},
                 }
@@ -258,6 +266,7 @@ class TestWaitForClusterReady:
             "nodes": {
                 "node1": {
                     "name": "node1",
+                    "roles": ["data_hot"],
                     "thread_pool": {"write": {"queue": 0}, "search": {"queue": 0}, "snapshot": {"queue": 0}},
                     "jvm": {"mem": {"heap_used_in_bytes": 400, "heap_max_in_bytes": 1000}},
                 }
@@ -280,6 +289,7 @@ class TestWaitForClusterReady:
             "nodes": {
                 "node1": {
                     "name": "node1",
+                    "roles": ["data_hot"],
                     "thread_pool": {"write": {"queue": 0}, "search": {"queue": 0}, "snapshot": {"queue": 0}},
                     "jvm": {"mem": {"heap_used_in_bytes": 400, "heap_max_in_bytes": 1000}},
                 }
@@ -303,3 +313,130 @@ class TestWaitForClusterReady:
         with patch("sharderator.engine.preflight.time.sleep") as mock_sleep:
             wait_for_cluster_ready(client, wait_timeout_minutes=0)
             mock_sleep.assert_not_called()
+
+
+class TestIsDataNode:
+    @pytest.mark.parametrize("role", [
+        "data", "data_hot", "data_warm", "data_cold", "data_frozen", "data_content",
+    ])
+    def test_returns_true_for_data_roles(self, role):
+        assert _is_data_node({"roles": [role]}) is True
+
+    @pytest.mark.parametrize("role", [
+        "master", "voting_only", "ml", "ingest", "remote_cluster_client", "transform",
+    ])
+    def test_returns_false_for_non_data_roles(self, role):
+        assert _is_data_node({"roles": [role]}) is False
+
+    def test_mixed_roles_with_data(self):
+        assert _is_data_node({"roles": ["master", "data_hot"]}) is True
+
+    def test_mixed_roles_without_data(self):
+        assert _is_data_node({"roles": ["master", "voting_only"]}) is False
+
+    def test_empty_roles(self):
+        assert _is_data_node({"roles": []}) is False
+
+    def test_missing_roles_key(self):
+        assert _is_data_node({}) is False
+
+
+class TestNodeFiltering:
+    """Verify that tiebreaker/master-only nodes are excluded from pressure checks."""
+
+    def test_circuit_breaker_skips_tiebreaker(self):
+        """Tiebreaker at 85% should NOT trigger; data node at 50% is fine."""
+        client = MagicMock()
+        client.nodes.stats.return_value = _breaker_stats(
+            {"data1": {"parent": (1000, 500)}, "tiebreaker": {"parent": (1000, 850)}},
+            roles_by_node={"data1": ["data_hot"], "tiebreaker": ["master", "voting_only"]},
+        )
+        # Should not raise — tiebreaker is skipped
+        check_circuit_breakers(client)
+
+    def test_circuit_breaker_catches_data_node(self):
+        """Data node at 85% should trigger even if tiebreaker is fine."""
+        client = MagicMock()
+        client.nodes.stats.return_value = _breaker_stats(
+            {"data1": {"parent": (1000, 850)}, "tiebreaker": {"parent": (1000, 500)}},
+            roles_by_node={"data1": ["data_hot"], "tiebreaker": ["master", "voting_only"]},
+        )
+        with pytest.raises(ClusterNotHealthyError, match="data1"):
+            check_circuit_breakers(client, wait_timeout_minutes=0)
+
+    def test_pressure_check_skips_tiebreaker_jvm(self):
+        """Tiebreaker at 92% JVM should NOT appear in issues."""
+        client = MagicMock()
+        client.cluster.pending_tasks.return_value = {"tasks": []}
+        client.cluster.health.return_value = {
+            "status": "green", "relocating_shards": 0, "initializing_shards": 0,
+        }
+        tp_jvm_stats = {
+            "nodes": {
+                "data1": {
+                    "name": "data1",
+                    "roles": ["data_hot"],
+                    "thread_pool": {"write": {"queue": 0}, "search": {"queue": 0}, "snapshot": {"queue": 0}},
+                    "jvm": {"mem": {"heap_used_in_bytes": 600, "heap_max_in_bytes": 1000}},
+                },
+                "tiebreaker": {
+                    "name": "tiebreaker",
+                    "roles": ["master", "voting_only"],
+                    "thread_pool": {"write": {"queue": 0}, "search": {"queue": 0}, "snapshot": {"queue": 0}},
+                    "jvm": {"mem": {"heap_used_in_bytes": 920, "heap_max_in_bytes": 1000}},
+                },
+            }
+        }
+        breaker_stats = _breaker_stats(
+            {"data1": {"parent": (1000, 500)}, "tiebreaker": {"parent": (1000, 500)}},
+            roles_by_node={"data1": ["data_hot"], "tiebreaker": ["master", "voting_only"]},
+        )
+        client.nodes.stats.side_effect = [tp_jvm_stats, breaker_stats]
+
+        issues = _check_cluster_pressure(client)
+        assert issues == []
+
+    def test_pressure_check_catches_data_node_jvm(self):
+        """Data node at 90% JVM should appear in issues."""
+        client = MagicMock()
+        client.cluster.pending_tasks.return_value = {"tasks": []}
+        client.cluster.health.return_value = {
+            "status": "green", "relocating_shards": 0, "initializing_shards": 0,
+        }
+        tp_jvm_stats = {
+            "nodes": {
+                "data1": {
+                    "name": "data1",
+                    "roles": ["data_hot"],
+                    "thread_pool": {"write": {"queue": 0}, "search": {"queue": 0}, "snapshot": {"queue": 0}},
+                    "jvm": {"mem": {"heap_used_in_bytes": 900, "heap_max_in_bytes": 1000}},
+                },
+                "tiebreaker": {
+                    "name": "tiebreaker",
+                    "roles": ["master", "voting_only"],
+                    "thread_pool": {"write": {"queue": 0}, "search": {"queue": 0}, "snapshot": {"queue": 0}},
+                    "jvm": {"mem": {"heap_used_in_bytes": 920, "heap_max_in_bytes": 1000}},
+                },
+            }
+        }
+        breaker_stats = _breaker_stats(
+            {"data1": {"parent": (1000, 500)}, "tiebreaker": {"parent": (1000, 500)}},
+            roles_by_node={"data1": ["data_hot"], "tiebreaker": ["master", "voting_only"]},
+        )
+        client.nodes.stats.side_effect = [tp_jvm_stats, breaker_stats]
+
+        issues = _check_cluster_pressure(client)
+        jvm_issues = [i for i in issues if "JVM" in i]
+        assert len(jvm_issues) == 1
+        assert "data1" in jvm_issues[0]
+        assert "tiebreaker" not in jvm_issues[0]
+
+    def test_get_hot_breakers_skips_non_data_node(self):
+        """_get_hot_breakers should skip non-data nodes entirely."""
+        client = MagicMock()
+        client.nodes.stats.return_value = _breaker_stats(
+            {"data1": {"parent": (1000, 700)}, "tiebreaker": {"parent": (1000, 900)}},
+            roles_by_node={"data1": ["data_hot"], "tiebreaker": ["master", "voting_only"]},
+        )
+        hot = _get_hot_breakers(client, threshold=0.80)
+        assert hot == []  # tiebreaker at 90% is skipped, data1 at 70% is below threshold

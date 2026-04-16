@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -27,10 +28,11 @@ from sharderator.engine.merge_analyzer import MergeGroup, propose_merges, valida
 from sharderator.engine.merge_orchestrator import MergeOrchestrator
 from sharderator.engine.orchestrator import Orchestrator
 from sharderator.engine.preflight import run_dry_run_preflight
+from sharderator.gui.analyze_widget import AnalyzeWidget
 from sharderator.gui.confirm_dialog import ConfirmDialog, MergeConfirmDialog
 from sharderator.gui.connection_dialog import ConnectionDialog
 from sharderator.gui.defrag_widget import DefragWidget
-from sharderator.gui.index_table import IndexTableModel, IndexTableView
+from sharderator.gui.index_table import IndexFilterProxy, IndexTableModel, IndexTableView
 from sharderator.gui.job_log import JobLog
 from sharderator.gui.job_history_dialog import JobHistoryDialog
 from sharderator.gui.merge_tree import MergeTreeWidget
@@ -184,18 +186,42 @@ class MainWindow(QMainWindow):
         splitter.setOrientation(Qt.Orientation.Vertical)
         main_layout.addWidget(splitter)
 
-        # Top: tab widget with Shrink Mode and Merge Mode
+        # Top: tab widget with Analyze, Shrink Mode, and Merge Mode
         self._tabs = QTabWidget()
         splitter.addWidget(self._tabs)
+
+        # --- Frozen Analyze Tab ---
+        self._analyze_widget = AnalyzeWidget()
+        self._tabs.addTab(self._analyze_widget, "Frozen Analyze")
 
         # --- Shrink Mode Tab ---
         shrink_tab = QWidget()
         shrink_layout = QVBoxLayout(shrink_tab)
         shrink_layout.setContentsMargins(4, 4, 4, 4)
 
+        # Filter bar
+        shrink_filter_bar = QHBoxLayout()
+        self._shrink_filter = QLineEdit()
+        self._shrink_filter.setPlaceholderText("Filter indices... (supports * wildcards)")
+        self._shrink_filter.setClearButtonEnabled(True)
+        shrink_filter_bar.addWidget(self._shrink_filter)
+
+        self._btn_shrink_select_all = QPushButton("Select All")
+        self._btn_shrink_select_all.clicked.connect(self._on_shrink_select_all)
+        shrink_filter_bar.addWidget(self._btn_shrink_select_all)
+
+        self._btn_shrink_deselect_all = QPushButton("Deselect All")
+        self._btn_shrink_deselect_all.clicked.connect(self._on_shrink_deselect_all)
+        shrink_filter_bar.addWidget(self._btn_shrink_deselect_all)
+
+        shrink_layout.addLayout(shrink_filter_bar)
+
         self._table_model = IndexTableModel()
+        self._shrink_proxy = IndexFilterProxy()
+        self._shrink_proxy.setSourceModel(self._table_model)
         self._table_view = IndexTableView()
-        self._table_view.setModel(self._table_model)
+        self._table_view.setModel(self._shrink_proxy)
+        self._shrink_filter.textChanged.connect(self._shrink_proxy.set_filter_text)
         shrink_layout.addWidget(self._table_view)
 
         self._lbl_shrink_summary = QLabel("Select indices to consolidate")
@@ -244,7 +270,25 @@ class MainWindow(QMainWindow):
         merge_controls.addStretch()
         merge_layout.addLayout(merge_controls)
 
+        # Filter bar
+        merge_filter_bar = QHBoxLayout()
+        self._merge_filter = QLineEdit()
+        self._merge_filter.setPlaceholderText("Filter merge groups... (supports * wildcards)")
+        self._merge_filter.setClearButtonEnabled(True)
+        merge_filter_bar.addWidget(self._merge_filter)
+
+        self._btn_merge_select_all = QPushButton("Select All")
+        self._btn_merge_select_all.clicked.connect(self._on_merge_select_all)
+        merge_filter_bar.addWidget(self._btn_merge_select_all)
+
+        self._btn_merge_deselect_all = QPushButton("Deselect All")
+        self._btn_merge_deselect_all.clicked.connect(self._on_merge_deselect_all)
+        merge_filter_bar.addWidget(self._btn_merge_deselect_all)
+
+        merge_layout.addLayout(merge_filter_bar)
+
         self._merge_tree = MergeTreeWidget()
+        self._merge_filter.textChanged.connect(self._merge_tree.apply_filter)
         merge_layout.addWidget(self._merge_tree)
 
         self._lbl_merge_summary = QLabel("Connect to a cluster to analyze merge candidates")
@@ -328,6 +372,10 @@ class MainWindow(QMainWindow):
         refresh_shortcut = QShortcut(QKeySequence("F5"), self)
         refresh_shortcut.activated.connect(self._on_refresh)
 
+        # Ctrl+A = select all visible in active tab
+        select_all_shortcut = QShortcut(QKeySequence("Ctrl+A"), self)
+        select_all_shortcut.activated.connect(self._on_ctrl_a)
+
         self.setStatusBar(QStatusBar())
 
     # --- Connection ---
@@ -370,6 +418,7 @@ class MainWindow(QMainWindow):
             self._conn.disconnect()
             self._table_model.set_indices([])
             self._merge_tree.clear()
+            self._analyze_widget.clear()
             self._frozen_indices = []
             self._update_connection_status()
             return
@@ -389,8 +438,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Connection Failed", str(e))
 
     def _load_indices(self) -> None:
+        stashed_names = self._table_model.get_checked_names()
         self._frozen_indices = list_frozen_indices(self._conn.client)
         self._table_model.set_indices(self._frozen_indices)
+        if stashed_names:
+            self._table_model.restore_checked_names(stashed_names)
         self._job_log.append_log(f"Loaded {len(self._frozen_indices)} frozen indices")
         has_indices = bool(self._frozen_indices)
         self._btn_dryrun.setEnabled(has_indices)
@@ -398,6 +450,17 @@ class MainWindow(QMainWindow):
         self._btn_export_shrink.setEnabled(has_indices)
         self._btn_merge_dryrun.setEnabled(has_indices)
         self._btn_merge_execute.setEnabled(has_indices)
+
+        # Update the Frozen Analyze tab
+        if self._frozen_indices:
+            from sharderator.engine.frozen_analyzer import analyze_frozen_tier
+            analysis = analyze_frozen_tier(
+                self._frozen_indices,
+                frozen_limit=self._conn.frozen_shard_limit,
+            )
+            self._analyze_widget.set_analysis(analysis)
+        else:
+            self._analyze_widget.clear()
 
     @pyqtSlot()
     def _on_settings(self) -> None:
@@ -497,12 +560,19 @@ class MainWindow(QMainWindow):
 
         groups = propose_merges(self._frozen_indices, granularity)
 
+        # Preserve checked groups across re-analysis
+        stashed_keys = self._merge_tree.get_checked_keys()
+
         # Wire up lazy validation — runs per-group when the user checks it
         self._merge_tree.set_validator(
             lambda g: validate_merge_group(self._conn.client, g),
             log_callback=self._job_log.append_log,
         )
         self._merge_tree.set_groups(groups)
+
+        # Restore previously checked groups
+        if stashed_keys:
+            self._merge_tree.restore_checked_keys(stashed_keys)
 
         total_sources = sum(len(g.source_indices) for g in groups)
         total_saved = sum(g.shard_reduction for g in groups)
@@ -578,6 +648,13 @@ class MainWindow(QMainWindow):
         # Flatten all source indices across groups for the defrag grid
         all_sources = [idx for g in groups for idx in g.source_indices]
         self._defrag.set_indices(all_sources)
+        # Register merge name mapping so the defrag widget can map
+        # merged output names back to source index cells
+        merge_map = {
+            g.merged_index_name: [idx.name for idx in g.source_indices]
+            for g in groups
+        }
+        self._defrag.set_merge_groups(merge_map)
         events = QtPipelineEvents()
         orch = MergeOrchestrator(self._conn.client, self._config.operation, events)
         self._worker = MergeWorkerThread(orch, groups)
@@ -587,6 +664,18 @@ class MainWindow(QMainWindow):
     # --- Shared ---
 
     def _wire_worker_signals(self, worker: ShrinkWorkerThread | MergeWorkerThread) -> None:
+        # Reset batch counters
+        self._batch_completed: list[str] = []
+        self._batch_failed: list[tuple[str, str]] = []
+        self._batch_total: int = 0
+
+        if isinstance(worker, ShrinkWorkerThread):
+            self._batch_total = len(worker._indices)
+            self._batch_mode = "Shrink"
+        elif isinstance(worker, MergeWorkerThread):
+            self._batch_total = len(worker._groups)
+            self._batch_mode = "Merge"
+
         worker.progress.connect(self._progress.update_progress)
         worker.progress.connect(self._defrag.update_progress)
         worker.state_changed.connect(self._defrag.update_state)
@@ -594,13 +683,17 @@ class MainWindow(QMainWindow):
         worker.state_changed.connect(
             lambda name, state: self.statusBar().showMessage(f"{name}: {state}")
         )
-        worker.completed.connect(
-            lambda name: self._job_log.append_log(f"✓ {name} COMPLETED")
-        )
-        worker.failed.connect(
-            lambda name, err: self._job_log.append_log(f"✗ {name} FAILED: {err}")
-        )
+        worker.completed.connect(self._on_index_completed)
+        worker.failed.connect(self._on_index_failed)
         worker.batch_done.connect(self._on_batch_done)
+
+    def _on_index_completed(self, name: str) -> None:
+        self._batch_completed.append(name)
+        self._job_log.append_log(f"✓ {name} COMPLETED")
+
+    def _on_index_failed(self, name: str, error: str) -> None:
+        self._batch_failed.append((name, error))
+        self._job_log.append_log(f"✗ {name} FAILED: {error}")
 
     @pyqtSlot()
     def _on_cancel(self) -> None:
@@ -617,6 +710,44 @@ class MainWindow(QMainWindow):
         self._progress.reset()
         self._on_refresh()
         self._job_log.append_log("=== Batch complete ===")
+
+        # Show completion summary dialog
+        completed = len(self._batch_completed)
+        failed = len(self._batch_failed)
+        total = self._batch_total
+        mode = getattr(self, "_batch_mode", "Operation")
+
+        if failed == 0:
+            icon = QMessageBox.Icon.Information
+            title = f"{mode} Complete"
+            lines = [f"All {completed} of {total} items completed successfully."]
+        elif completed == 0:
+            icon = QMessageBox.Icon.Critical
+            title = f"{mode} Failed"
+            lines = [f"All {failed} of {total} items failed."]
+        else:
+            icon = QMessageBox.Icon.Warning
+            title = f"{mode} Complete (with errors)"
+            lines = [f"{completed} of {total} completed, {failed} failed."]
+
+        # Shard savings from the defrag widget
+        if self._defrag._total_shards_saved > 0:
+            lines.append(f"\nShards reclaimed: {self._defrag._total_shards_saved}")
+            lines.append(
+                f"Budget: {self._conn.frozen_shard_count} / {self._conn.frozen_shard_limit}"
+            )
+
+        # List failures (up to 5)
+        if self._batch_failed:
+            lines.append("\nFailed items:")
+            for name, error in self._batch_failed[:5]:
+                short_err = error[:120] + "..." if len(error) > 120 else error
+                lines.append(f"  • {name}: {short_err}")
+            if len(self._batch_failed) > 5:
+                lines.append(f"  ... and {len(self._batch_failed) - 5} more (see job log)")
+
+        msg = QMessageBox(icon, title, "\n".join(lines), QMessageBox.StandardButton.Ok, self)
+        msg.exec()
 
     def _set_running(self, running: bool) -> None:
         self._btn_analyze.setEnabled(not running)
@@ -642,6 +773,35 @@ class MainWindow(QMainWindow):
         self._load_indices()
         self._load_tracker()
         self._job_log.append_log("Refreshed cluster state")
+
+    # --- Filter / Select All ---
+
+    @pyqtSlot()
+    def _on_shrink_select_all(self) -> None:
+        rows = self._shrink_proxy.visible_source_rows()
+        self._table_model.select_visible(rows)
+
+    @pyqtSlot()
+    def _on_shrink_deselect_all(self) -> None:
+        rows = self._shrink_proxy.visible_source_rows()
+        self._table_model.deselect_visible(rows)
+
+    @pyqtSlot()
+    def _on_merge_select_all(self) -> None:
+        self._merge_tree.select_visible()
+
+    @pyqtSlot()
+    def _on_merge_deselect_all(self) -> None:
+        self._merge_tree.deselect_visible()
+
+    @pyqtSlot()
+    def _on_ctrl_a(self) -> None:
+        """Ctrl+A: select all visible in the active tab."""
+        current = self._tabs.currentIndex()
+        if current == 1:  # Shrink Mode
+            self._on_shrink_select_all()
+        elif current == 2:  # Merge Mode
+            self._on_merge_select_all()
 
     # --- Job Tracker ---
 
@@ -694,6 +854,10 @@ class MainWindow(QMainWindow):
 
             self._set_running(True)
             self._defrag.set_indices(group.source_indices)
+            # Register merge name mapping for defrag widget
+            self._defrag.set_merge_groups({
+                group.merged_index_name: [idx.name for idx in group.source_indices]
+            })
             events = QtPipelineEvents()
             orch = MergeOrchestrator(
                 self._conn.client, self._config.operation, events

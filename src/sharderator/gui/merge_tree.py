@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 from typing import Callable
 
 from PyQt6.QtCore import Qt
@@ -171,3 +172,99 @@ class MergeTreeWidget(QTreeWidget):
         total_merged = len(groups)
         total_saved = sum(g.shard_reduction for g in groups)
         return total_sources, total_merged, total_saved
+
+    def apply_filter(self, text: str) -> None:
+        """Show/hide tree items based on a filter pattern.
+
+        Matches against the parent item's text (base pattern name).
+        Supports glob wildcards (*). Without wildcards, treats as substring.
+        If a parent matches, all its children are shown.
+        """
+        pattern = text.strip().lower()
+        for idx in range(self.topLevelItemCount()):
+            parent = self.topLevelItem(idx)
+            name = parent.text(0).lower()
+            if not pattern:
+                visible = True
+            elif "*" in pattern or "?" in pattern:
+                visible = fnmatch.fnmatch(name, pattern)
+            else:
+                visible = pattern in name
+            parent.setHidden(not visible)
+            for child_idx in range(parent.childCount()):
+                parent.child(child_idx).setHidden(not visible)
+
+    def select_visible(self) -> None:
+        """Check all visible (not hidden) groups."""
+        self.blockSignals(True)
+        parents_to_validate: list[QTreeWidgetItem] = []
+        for idx in range(self.topLevelItemCount()):
+            parent = self.topLevelItem(idx)
+            if parent.isHidden():
+                continue
+            parent.setCheckState(0, Qt.CheckState.Checked)
+            parents_to_validate.append(parent)
+            for child_idx in range(parent.childCount()):
+                child = parent.child(child_idx)
+                if child.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                    child.setCheckState(0, Qt.CheckState.Checked)
+        self.blockSignals(False)
+        # Run lazy validation for newly checked children
+        for parent in parents_to_validate:
+            for child_idx in range(parent.childCount()):
+                child = parent.child(child_idx)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    self._lazy_validate(child)
+
+    def deselect_visible(self) -> None:
+        """Uncheck all visible (not hidden) groups."""
+        self.blockSignals(True)
+        for idx in range(self.topLevelItemCount()):
+            parent = self.topLevelItem(idx)
+            if parent.isHidden():
+                continue
+            parent.setCheckState(0, Qt.CheckState.Unchecked)
+            for child_idx in range(parent.childCount()):
+                child = parent.child(child_idx)
+                child.setCheckState(0, Qt.CheckState.Unchecked)
+        self.blockSignals(False)
+
+    def get_checked_keys(self) -> set[str]:
+        """Return the set of checked group keys for persistence across re-analysis."""
+        keys = set()
+        for idx in range(self.topLevelItemCount()):
+            parent = self.topLevelItem(idx)
+            for child_idx in range(parent.childCount()):
+                child = parent.child(child_idx)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    key = child.data(0, _GROUP_ROLE)
+                    if key:
+                        keys.add(key)
+        return keys
+
+    def restore_checked_keys(self, keys: set[str]) -> None:
+        """Re-check groups whose key is in the given set."""
+        if not keys:
+            return
+        self.blockSignals(True)
+        for idx in range(self.topLevelItemCount()):
+            parent = self.topLevelItem(idx)
+            checked_count = 0
+            for child_idx in range(parent.childCount()):
+                child = parent.child(child_idx)
+                key = child.data(0, _GROUP_ROLE)
+                if key in keys and (child.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                    child.setCheckState(0, Qt.CheckState.Checked)
+                    checked_count += 1
+            if checked_count == parent.childCount() and checked_count > 0:
+                parent.setCheckState(0, Qt.CheckState.Checked)
+            elif checked_count > 0:
+                parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+        self.blockSignals(False)
+        # Run lazy validation for restored checks
+        for idx in range(self.topLevelItemCount()):
+            parent = self.topLevelItem(idx)
+            for child_idx in range(parent.childCount()):
+                child = parent.child(child_idx)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    self._lazy_validate(child)

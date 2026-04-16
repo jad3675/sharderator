@@ -213,6 +213,65 @@ class TestMergeGroupFromJob:
         assert group.time_bucket == "2026.02"
 
 
+class TestSharderatedSuffix:
+    """Tests for -sharderated suffix handling in INDEX_PATTERN and _parse_merged_name."""
+
+    def test_index_pattern_matches_sharderated(self):
+        """INDEX_PATTERN should match indices with -sharderated suffix."""
+        from sharderator.engine.merge_analyzer import INDEX_PATTERN
+
+        m = INDEX_PATTERN.match(
+            "partial-.ds-test-oversharded-10-metrics-2026.04.15-000001-sharderated"
+        )
+        assert m is not None
+        assert m.group(1) == "test-oversharded-10-metrics"
+        assert m.group(2) == "2026.04.15"
+
+    def test_index_pattern_matches_normal(self):
+        """INDEX_PATTERN should still match non-sharderated names (regression check)."""
+        from sharderator.engine.merge_analyzer import INDEX_PATTERN
+
+        m = INDEX_PATTERN.match(
+            "partial-.ds-metrics-cpu-default-2026.02.14-000804"
+        )
+        assert m is not None
+        assert m.group(1) == "metrics-cpu-default"
+        assert m.group(2) == "2026.02.14"
+
+    def test_parse_merged_name_with_sharderated_suffix(self):
+        """_parse_merged_name should strip -sharderated before parsing."""
+        from sharderator.engine.merge_analyzer import _parse_merged_name
+
+        base, bucket = _parse_merged_name(
+            "partial-.ds-metrics-cpu-default-2026.02-merged-sharderated"
+        )
+        assert base == "metrics-cpu-default"
+        assert bucket == "2026.02"
+
+    def test_propose_merges_includes_sharderated(self):
+        """Sharderated indices should be grouped alongside non-sharderated ones."""
+        indices = [
+            _make_index("partial-.ds-metrics-cpu-default-2026.02.01-000001-sharderated"),
+            _make_index("partial-.ds-metrics-cpu-default-2026.02.15-000002"),
+            _make_index("partial-.ds-metrics-cpu-default-2026.02.28-000003-sharderated"),
+        ]
+        groups = propose_merges(indices, "monthly")
+        assert len(groups) == 1
+        assert groups[0].time_bucket == "2026.02"
+        assert len(groups[0].source_indices) == 3
+
+    def test_index_pattern_no_generation_with_sharderated(self):
+        """INDEX_PATTERN should match sharderated names without a generation number."""
+        from sharderator.engine.merge_analyzer import INDEX_PATTERN
+
+        m = INDEX_PATTERN.match(
+            "partial-.ds-logs-app-2026.03.01-sharderated"
+        )
+        assert m is not None
+        assert m.group(1) == "logs-app"
+        assert m.group(2) == "2026.03.01"
+
+
 class TestUnionAnalysisSettings:
     def test_analysis_conflict_detected(self):
         from sharderator.engine.merger import _union_analysis_settings

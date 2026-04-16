@@ -18,7 +18,8 @@ INDEX_PATTERN = re.compile(
     r"^(?:\.?partial-)?(?:\.ds-)?"  # optional prefixes
     r"(.+?)"  # base name (non-greedy)
     r"-(\d{4}\.\d{2}\.\d{2})"  # date YYYY.MM.DD
-    r"(?:-\d+)?$"  # optional generation number
+    r"(?:-\d+)?"  # optional generation number
+    r"(?:-sharderated)?$"  # optional Sharderator suffix
 )
 
 
@@ -171,14 +172,19 @@ def _date_to_bucket(date_str: str, granularity: str) -> str:
 def _parse_merged_name(name: str) -> tuple[str, str]:
     """Extract base_pattern and time_bucket from a merged index name.
 
-    Handles both naming formats:
-      partial-.ds-metrics-system.cpu-default-2026.02-merged  (final frozen mount)
-      sharderator-merged-metrics-system.cpu-default-2026.02  (intermediate working name)
+    Handles naming formats:
+      partial-.ds-metrics-system.cpu-default-2026.02-merged              (merge mount)
+      partial-.ds-metrics-system.cpu-default-2026.02-merged-sharderated  (future)
+      sharderator-merged-metrics-system.cpu-default-2026.02              (intermediate)
 
     The time bucket is the last hyphen-delimited segment. This works for
     monthly (2026.02), quarterly (2026.Q1), and yearly (2026) buckets.
     """
     stripped = name
+
+    # Strip Sharderator suffix first (outermost layer)
+    if stripped.endswith("-sharderated"):
+        stripped = stripped[: -len("-sharderated")]
 
     # Strip the final frozen mount format
     if stripped.endswith("-merged"):

@@ -39,18 +39,32 @@ class TerminalDefrag:
         self._states: dict[str, str] = {}
         self._shards: dict[str, int] = {}
         self._order: list[str] = []
+        self._merge_name_map: dict[str, list[str]] = {}
         self._last_line_count: int = 0
 
     def set_indices(self, names_and_shards: list[tuple[str, int]]) -> None:
         self._order = [n for n, _ in names_and_shards]
         self._shards = {n: s for n, s in names_and_shards}
         self._states = {n: "PENDING" for n in self._order}
+        self._merge_name_map = {}
         self._last_line_count = 0
+
+    def set_merge_groups(self, merge_map: dict[str, list[str]]) -> None:
+        """Register merged output name → source index name mapping."""
+        self._merge_name_map = dict(merge_map)
 
     def update_state(self, name: str, state: str) -> None:
         if name in self._states:
             self._states[name] = state
             self._render()
+        else:
+            # Fall back to merge name map — fan out to source indices
+            source_names = self._merge_name_map.get(name)
+            if source_names:
+                for src in source_names:
+                    if src in self._states:
+                        self._states[src] = state
+                self._render()
 
     def _render(self) -> None:
         cols = shutil.get_terminal_size().columns - 4
@@ -151,6 +165,12 @@ def main():
     p_report.add_argument("--state", choices=["COMPLETED", "FAILED", "all"], default="all",
                           help="Filter by job state")
 
+    p_analyze = sub.add_parser("analyze", help="Analyze frozen tier health and optimization opportunities")
+    _add_connection_args(p_analyze)
+    p_analyze.add_argument("--json", action="store_true", help="Output as JSON")
+    p_analyze.add_argument("--min-shards", type=int, default=2,
+                           help="Minimum shard count to flag as over-sharded")
+
     args = parser.parse_args()
     conn = _connect(args)
 
@@ -165,6 +185,8 @@ def main():
             _cmd_merge(conn, args)
         elif args.command == "report":
             _cmd_report(conn, args)
+        elif args.command == "analyze":
+            _cmd_analyze(conn, args)
     finally:
         conn.disconnect()
 
@@ -211,6 +233,8 @@ def _cmd_shrink(conn: ClusterConnection, args) -> None:
     if args.index:
         indices = [i for i in indices if i.name in args.index]
     indices = [i for i in indices if i.shard_count >= args.min_shards]
+    # Filter out indices already at or below target — nothing to shrink
+    indices = [i for i in indices if i.shard_count > i.target_shard_count]
     if args.max_indices > 0:
         indices = indices[: args.max_indices]
     if not indices:
@@ -366,6 +390,13 @@ def _cmd_merge(conn: ClusterConnection, args) -> None:
     all_sources = [(idx.name, idx.shard_count) for g in groups for idx in g.source_indices]
     defrag = TerminalDefrag()
     defrag.set_indices(all_sources)
+    # Register merge name mapping so the terminal defrag can map
+    # merged output names back to source index cells
+    merge_map = {
+        g.merged_index_name: [idx.name for idx in g.source_indices]
+        for g in groups
+    }
+    defrag.set_merge_groups(merge_map)
     events = CliEvents(defrag)
 
     from sharderator.engine.merge_orchestrator import MergeOrchestrator
@@ -409,6 +440,25 @@ def _cmd_report(conn: ClusterConnection, args) -> None:
         "jobs": [j.to_dict() for j in jobs],
     }
     print(json.dumps(output, indent=2, default=str))
+
+
+def _cmd_analyze(conn: ClusterConnection, args) -> None:
+    """Analyze frozen tier health and show optimization opportunities."""
+    from sharderator.engine.frozen_analyzer import analyze_frozen_tier
+
+    indices = list_frozen_indices(conn.client)
+    min_shards = getattr(args, "min_shards", 2)
+    analysis = analyze_frozen_tier(
+        indices,
+        frozen_limit=conn.frozen_shard_limit,
+        min_shards_for_shrink=min_shards,
+    )
+
+    if getattr(args, "json", False):
+        import json
+        print(json.dumps(analysis.to_dict(), indent=2))
+    else:
+        print(analysis.format_text())
 
 
 # --- Helpers ---

@@ -25,12 +25,19 @@ def remount(
     """Mount the new snapshot as a partially mounted (frozen) index. Returns new index name."""
     job.transition(JobState.REMOUNTING)
 
-    temp_mount_name = f"partial-sharderator-{info.original_index_name}"
+    # Preserve the original frozen mount name with a -sharderated suffix.
+    # This keeps the partial-.ds- prefix that Kibana and ILM expect.
+    # Strip any existing -sharderated suffix to prevent double-suffixing on re-runs.
+    base_name = info.name.removesuffix("-sharderated")
+    temp_mount_name = f"{base_name}-sharderated"
 
-    # Clean up stale mount from a previous failed run
-    if client.indices.exists(index=temp_mount_name):
-        log.warning("mount_exists_deleting", index=temp_mount_name)
-        client.indices.delete(index=temp_mount_name)
+    # Clean up stale mount from a previous failed run.
+    # Check both new and old naming conventions for transition safety.
+    old_convention_name = f"partial-sharderator-{info.original_index_name}"
+    for stale_name in (temp_mount_name, old_convention_name):
+        if stale_name and client.indices.exists(index=stale_name):
+            log.warning("mount_exists_deleting", index=stale_name)
+            client.indices.delete(index=stale_name)
 
     log.info("remounting", snapshot=snap_name, as_index=temp_mount_name)
 

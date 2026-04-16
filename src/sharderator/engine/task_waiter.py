@@ -24,6 +24,8 @@ TRANSIENT_FAILURE_TYPES = {
     "receive_timeout_transport_exception",
     "send_request_transport_exception",
     "connect_transport_exception",
+    "search_context_missing_exception",
+    "search_phase_execution_exception",
 }
 
 

@@ -156,3 +156,103 @@ def test_cell_count_matches_total_shards(widget):
     ]
     widget.set_indices(indices)
     assert len(widget._all_cells) == 11  # 3 + 7 + 1
+
+
+# --- Merge name mapping tests ---
+
+def test_merge_name_map_fans_out_state(widget):
+    """State update via merged output name should fan out to all source groups."""
+    indices = [
+        IndexInfo(name="src-a", shard_count=3, doc_count=0, store_size_bytes=0, target_shard_count=1),
+        IndexInfo(name="src-b", shard_count=4, doc_count=0, store_size_bytes=0, target_shard_count=1),
+    ]
+    widget.set_indices(indices)
+    widget.set_merge_groups({"merged-output": ["src-a", "src-b"]})
+
+    widget.update_state("merged-output", "RESTORING")
+
+    assert widget._group_map["src-a"].state == "RESTORING"
+    assert widget._group_map["src-b"].state == "RESTORING"
+    assert widget._current_state == "RESTORING"
+
+
+def test_merge_name_map_completed_collapses_all(widget):
+    """COMPLETED via merged name should collapse all source groups."""
+    indices = [
+        IndexInfo(name="src-a", shard_count=5, doc_count=0, store_size_bytes=0, target_shard_count=1),
+        IndexInfo(name="src-b", shard_count=3, doc_count=0, store_size_bytes=0, target_shard_count=1),
+    ]
+    widget.set_indices(indices)
+    widget.set_merge_groups({"merged-output": ["src-a", "src-b"]})
+
+    widget.update_state("merged-output", "COMPLETED")
+
+    # Both groups should be collapsed
+    assert widget._group_map["src-a"].cells[0].state == "COMPLETED"
+    assert widget._group_map["src-a"].cells[1].state == "FREED"
+    assert widget._group_map["src-b"].cells[0].state == "COMPLETED"
+    assert widget._group_map["src-b"].cells[1].state == "FREED"
+
+    # Completed count = 2 (one per source group)
+    assert widget._completed_count == 2
+    # Shards saved = (5-1) + (3-1) = 6
+    assert widget._total_shards_saved == 6
+
+
+def test_merge_name_map_failed_marks_all(widget):
+    """FAILED via merged name should mark all source cells as FAILED."""
+    indices = [
+        IndexInfo(name="src-a", shard_count=2, doc_count=0, store_size_bytes=0, target_shard_count=1),
+        IndexInfo(name="src-b", shard_count=2, doc_count=0, store_size_bytes=0, target_shard_count=1),
+    ]
+    widget.set_indices(indices)
+    widget.set_merge_groups({"merged-output": ["src-a", "src-b"]})
+
+    widget.update_state("merged-output", "FAILED")
+
+    assert all(c.state == "FAILED" for c in widget._group_map["src-a"].cells)
+    assert all(c.state == "FAILED" for c in widget._group_map["src-b"].cells)
+    assert widget._completed_count == 0
+
+
+def test_merge_name_map_progress_fans_out(widget):
+    """Progress update via merged name should update all source groups."""
+    indices = [
+        IndexInfo(name="src-a", shard_count=2, doc_count=0, store_size_bytes=0, target_shard_count=1),
+        IndexInfo(name="src-b", shard_count=2, doc_count=0, store_size_bytes=0, target_shard_count=1),
+    ]
+    widget.set_indices(indices)
+    widget.set_merge_groups({"merged-output": ["src-a", "src-b"]})
+
+    widget.update_progress("merged-output", 42.5)
+
+    assert widget._group_map["src-a"].progress == 42.5
+    assert widget._group_map["src-b"].progress == 42.5
+    assert widget._current_pct == 42.5
+
+
+def test_merge_name_map_unknown_merged_name_ignored(widget):
+    """Unknown merged name with no mapping should be silently ignored."""
+    widget.set_indices(_make_indices(1))
+    widget.set_merge_groups({})
+
+    widget.update_state("nonexistent-merged", "RESTORING")
+    assert widget._completed_count == 0
+
+
+def test_merge_name_map_cleared_on_set_indices(widget):
+    """set_indices should clear any previous merge name mapping."""
+    widget.set_indices(_make_indices(1))
+    widget.set_merge_groups({"merged": ["idx-0"]})
+    assert widget._merge_name_map == {"merged": ["idx-0"]}
+
+    widget.set_indices(_make_indices(1))
+    assert widget._merge_name_map == {}
+
+
+def test_merge_name_map_cleared_on_reset(widget):
+    """reset should clear the merge name mapping."""
+    widget.set_indices(_make_indices(1))
+    widget.set_merge_groups({"merged": ["idx-0"]})
+    widget.reset()
+    assert widget._merge_name_map == {}

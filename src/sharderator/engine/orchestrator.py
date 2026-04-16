@@ -91,6 +91,26 @@ class Orchestrator:
             if not cfg.ignore_circuit_breakers:
                 check_circuit_breakers(c, wait_timeout_minutes=cfg.circuit_breaker_wait_minutes)
             info = analyze(c, info, job)
+
+            # Guard: skip indices that are already at or below target shard count.
+            # This catches merged indices (1 shard) that were accidentally selected
+            # for shrink, and any other case where there's nothing to do.
+            if info.shard_count <= info.target_shard_count:
+                log.info(
+                    "skipping_already_optimal",
+                    index=info.name,
+                    shards=info.shard_count,
+                    target=info.target_shard_count,
+                )
+                ev.on_log(
+                    f"{info.name}: already at {info.shard_count} shard(s) "
+                    f"(target {info.target_shard_count}), skipping"
+                )
+                job.transition(JobState.COMPLETED)
+                self._emit_state(info.name, JobState.COMPLETED)
+                self._events.on_completed(info.name)
+                return
+
             self._emit_state(info.name, job.state)
             _save()
             _check_cancel()

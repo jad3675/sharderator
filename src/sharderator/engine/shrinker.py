@@ -7,7 +7,7 @@ import time
 from elasticsearch import Elasticsearch
 
 from sharderator.client.queries import get_warm_hot_nodes
-from sharderator.engine.task_waiter import wait_for_task
+from sharderator.engine.task_waiter import wait_for_task, TransientReindexError
 from sharderator.models.index_info import IndexInfo
 from sharderator.models.job import JobRecord, JobState
 from sharderator.util.logging import get_logger
@@ -15,6 +15,7 @@ from sharderator.util.logging import get_logger
 log = get_logger(__name__)
 
 SHRUNK_PREFIX = "sharderator-shrunk-"
+MAX_REINDEX_RETRIES = 3
 
 
 def shrink(
@@ -58,11 +59,71 @@ def wait_for_reindex(
     job: JobRecord,
     timeout_minutes: int = 120,
     progress_callback=None,
+    max_retries: int = MAX_REINDEX_RETRIES,
 ) -> None:
-    """Wait for async reindex task to complete (reindex fallback path)."""
+    """Wait for async reindex task to complete, with retry on transient failures.
+
+    On transient failures (scroll expiry, unavailable shards, node disconnects),
+    waits for the target index to recover and retries with conflicts:proceed to
+    fill in the gaps. Permanent failures (mapping errors, etc.) propagate immediately.
+    """
     job.transition(JobState.AWAITING_REINDEX)
-    wait_for_task(client, job.merge_task_id, progress_callback, timeout_minutes)
-    log.info("reindex_complete", index=job.shrunk_index)
+
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            wait_for_task(client, job.merge_task_id, progress_callback, timeout_minutes)
+            log.info("reindex_complete", index=job.shrunk_index, attempts=attempt)
+            return
+        except TransientReindexError as e:
+            last_error = e
+            log.warning(
+                "shrink_reindex_transient_failure",
+                index=job.shrunk_index,
+                attempt=attempt,
+                max_retries=max_retries,
+                failures=e.failure_count,
+                created=e.created,
+                total=e.total,
+            )
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    f"Shrink reindex failed after {max_retries} attempts due to "
+                    f"transient errors. Last: {e}"
+                )
+
+            # Wait for target index to stabilize before retrying
+            log.info("shrink_reindex_retry_backoff", seconds=30 * attempt)
+            time.sleep(30 * attempt)
+            _wait_for_green(client, job.shrunk_index, timeout_minutes=10)
+
+            # Retry with conflicts:proceed — already-indexed docs are skipped
+            # via 409 version conflict rather than failing the task.
+            log.info(
+                "shrink_reindex_retry",
+                index=job.shrunk_index,
+                attempt=attempt + 1,
+            )
+            rps = None  # Use whatever the original was — we don't have it here,
+            # but the retry is filling gaps so unlimited is fine
+            resp = client.reindex(
+                body={
+                    "source": {"index": job.restore_index},
+                    "dest": {
+                        "index": job.shrunk_index,
+                        "op_type": "create",
+                    },
+                    "conflicts": "proceed",
+                },
+                wait_for_completion=False,
+                request_timeout=30,
+                scroll="30m",
+            )
+            job.merge_task_id = resp.get("task", "")
+
+    # Should not be reachable
+    raise RuntimeError(f"Shrink reindex failed after {max_retries} attempts. Last: {last_error}")
 
 
 def _shrink(
@@ -139,6 +200,7 @@ def _reindex_async(
         wait_for_completion=False,
         requests_per_second=rps,
         request_timeout=30,
+        scroll="30m",
     )
     return resp.get("task", "")
 

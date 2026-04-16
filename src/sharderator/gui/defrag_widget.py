@@ -84,6 +84,7 @@ class DefragWidget(QWidget):
         super().__init__(parent)
         self._groups: list[IndexGroup] = []
         self._group_map: dict[str, IndexGroup] = {}
+        self._merge_name_map: dict[str, list[str]] = {}
         self._all_cells: list[ShardCell] = []
         self._cell_rects: list[tuple[QRect, ShardCell]] = []
         self._completed_count: int = 0
@@ -111,6 +112,7 @@ class DefragWidget(QWidget):
         """Initialize the grid — one cell per shard across all indices."""
         self._groups = []
         self._group_map = {}
+        self._merge_name_map = {}
         self._all_cells = []
         self._cell_rects = []
         self._completed_count = 0
@@ -143,13 +145,36 @@ class DefragWidget(QWidget):
         self._pulse_timer.start()
         self.update()
 
+    def set_merge_groups(self, merge_map: dict[str, list[str]]) -> None:
+        """Register a mapping from merged output names to source index names.
+
+        During merge operations, the orchestrator emits state changes keyed
+        by the merged output name (e.g. 'partial-.ds-...-2026.04-merged'),
+        but the defrag grid is keyed by source index names. This mapping
+        bridges the gap so update_state() can fan out merged-name events
+        to all source index cells.
+        """
+        self._merge_name_map = dict(merge_map)
+
     def update_state(self, index_name: str, state: str) -> None:
         """Called when state_changed signal fires. Triggers sweep animation."""
         group = self._group_map.get(index_name)
-        if not group:
+        if group:
+            self._update_single_group(group, index_name, state)
             return
+
+        # Fall back to merge name map — fan out to all source indices
+        source_names = self._merge_name_map.get(index_name)
+        if source_names:
+            for src_name in source_names:
+                src_group = self._group_map.get(src_name)
+                if src_group:
+                    self._update_single_group(src_group, index_name, state)
+
+    def _update_single_group(self, group: IndexGroup, display_name: str, state: str) -> None:
+        """Apply a state update to a single IndexGroup."""
         group.state = state
-        self._current_index = index_name
+        self._current_index = display_name
         self._current_state = state
 
         if state == "COMPLETED":
@@ -174,6 +199,14 @@ class DefragWidget(QWidget):
         group = self._group_map.get(index_name)
         if group:
             group.progress = pct
+        else:
+            # Fall back to merge name map
+            source_names = self._merge_name_map.get(index_name)
+            if source_names:
+                for src_name in source_names:
+                    src_group = self._group_map.get(src_name)
+                    if src_group:
+                        src_group.progress = pct
         self._current_pct = pct
         self.update()
 
@@ -181,6 +214,7 @@ class DefragWidget(QWidget):
         """Clear the grid."""
         self._groups.clear()
         self._group_map.clear()
+        self._merge_name_map.clear()
         self._all_cells.clear()
         self._cell_rects.clear()
         self._sweep_queue.clear()
@@ -262,15 +296,31 @@ class DefragWidget(QWidget):
 
         # Highlight + border on active index cells
         if self._current_index:
-            group = self._group_map.get(self._current_index)
-            if group and group.state not in ("COMPLETED", "FAILED", "PENDING"):
-                for cell_rect, cell in self._cell_rects:
-                    if cell.index_name == self._current_index and not cell.collapsed:
-                        painter.fillRect(cell_rect, QColor(255, 255, 255, 50))
-                painter.setPen(QPen(QColor(255, 255, 255, 140), 1))
-                for cell_rect, cell in self._cell_rects:
-                    if cell.index_name == self._current_index and not cell.collapsed:
-                        painter.drawRect(cell_rect)
+            # Collect all index names that belong to the current active operation
+            active_names = set()
+            if self._current_index in self._group_map:
+                active_names.add(self._current_index)
+            else:
+                # Merged name — highlight all source indices
+                active_names.update(self._merge_name_map.get(self._current_index, []))
+
+            if active_names:
+                # Check if any active group is in a highlightable state
+                highlight = False
+                for name in active_names:
+                    g = self._group_map.get(name)
+                    if g and g.state not in ("COMPLETED", "FAILED", "PENDING"):
+                        highlight = True
+                        break
+
+                if highlight:
+                    for cell_rect, cell in self._cell_rects:
+                        if cell.index_name in active_names and not cell.collapsed:
+                            painter.fillRect(cell_rect, QColor(255, 255, 255, 50))
+                    painter.setPen(QPen(QColor(255, 255, 255, 140), 1))
+                    for cell_rect, cell in self._cell_rects:
+                        if cell.index_name in active_names and not cell.collapsed:
+                            painter.drawRect(cell_rect)
 
         # Scan-line highlight on next sweep cell
         if self._sweep_queue:

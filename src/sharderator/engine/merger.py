@@ -328,7 +328,9 @@ def merge_reindex(
         )
 
         body: dict = {
-            "source": {"index": restore_names},
+            "source": {
+                "index": restore_names,
+            },
             "dest": {"index": merged_name},
         }
 
@@ -342,6 +344,7 @@ def merge_reindex(
             wait_for_completion=False,
             requests_per_second=rps,
             request_timeout=30,
+            scroll="30m",
         )
         task_id = resp.get("task", "")
         job.merge_task_id = task_id

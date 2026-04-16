@@ -88,6 +88,7 @@ def _safe_delete_snapshot(
         snap_indices = snaps[0].get("indices", [])
 
         for idx_name in snap_indices:
+            # Check standard mount prefixes
             for prefix in ("partial-", ".partial-", "restored-", ".restored-"):
                 mounted_name = f"{prefix}{idx_name}"
                 if client.indices.exists(index=mounted_name):
@@ -95,6 +96,25 @@ def _safe_delete_snapshot(
                         "snapshot_still_referenced",
                         snapshot=snapshot,
                         by_index=mounted_name,
+                    )
+                    return
+
+            # Check for Sharderator-suffixed mounts.
+            # A snapshot containing "sharderator-shrunk-.ds-foo-2026.04.15-000001"
+            # may have been mounted as "partial-.ds-foo-2026.04.15-000001-sharderated".
+            for prefix in ("partial-", ".partial-"):
+                # Strip the sharderator working prefix to reconstruct the original name
+                original = idx_name
+                for work_prefix in ("sharderator-shrunk-", "sharderator-restore-", "sharderator-merged-"):
+                    if original.startswith(work_prefix):
+                        original = original[len(work_prefix):]
+                        break
+                sharderated_name = f"{prefix}{original}-sharderated"
+                if client.indices.exists(index=sharderated_name):
+                    log.warning(
+                        "snapshot_still_referenced",
+                        snapshot=snapshot,
+                        by_index=sharderated_name,
                     )
                     return
 
