@@ -148,6 +148,26 @@ def validate(cloud_id, api_key, phase, output_dir):
 
 @main.command()
 @_common_options
+def freeze(cloud_id, api_key):
+    """Lock down ILM policies to prevent further rollovers.
+
+    After all test indices have frozen, run this to change the ILM rollover
+    to max_age: 365d. This stops data streams from creating new backing
+    indices while you test Sharderator against a stable frozen tier.
+    """
+    try:
+        from rich.console import Console
+        console = Console()
+    except ImportError:
+        console = None
+
+    client = make_client(cloud_id, api_key)
+    from sharderator_test.fixtures import freeze_ilm
+    freeze_ilm(client, console)
+
+
+@main.command()
+@_common_options
 @click.option("--dry-run", is_flag=True, help="Show what would be deleted without deleting")
 def cleanup(cloud_id, api_key, dry_run):
     """Remove all test artifacts from the cluster."""

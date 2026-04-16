@@ -163,6 +163,66 @@ def setup_cluster(client: Elasticsearch, console=None) -> None:
     _log("\n[bold]Setup complete.[/bold] Ready to ingest data." if console else "\nSetup complete. Ready to ingest data.")
 
 
+def freeze_ilm(client: Elasticsearch, console=None) -> None:
+    """Update ILM policies to prevent further rollovers.
+
+    Changes the oversharded policy rollover from max_age: 1m to max_age: 365d
+    and the daily policy frozen min_age from 1m to 365d. This locks the frozen
+    tier in place so Sharderator can operate on a stable set of indices.
+    """
+    _log = console.print if console else print
+
+    # Update oversharded policy — stop rollovers
+    frozen_oversharded = {
+        "policy": {
+            "phases": {
+                "hot": {
+                    "min_age": "0ms",
+                    "actions": {
+                        "rollover": {"max_age": "365d"}
+                    },
+                },
+                "frozen": {
+                    "min_age": "1m",
+                    "actions": {
+                        "searchable_snapshot": {
+                            "snapshot_repository": "found-snapshots"
+                        }
+                    },
+                },
+            }
+        }
+    }
+    client.ilm.put_lifecycle(name=ILM_POLICY_OVERSHARDED, body=frozen_oversharded)
+    _log(f"[green]✓[/green] {ILM_POLICY_OVERSHARDED}: rollover changed to max_age=365d" if console
+         else f"✓ {ILM_POLICY_OVERSHARDED}: rollover changed to max_age=365d")
+
+    # Update daily policy — stop new indices from freezing
+    frozen_daily = {
+        "policy": {
+            "phases": {
+                "hot": {"min_age": "0ms", "actions": {}},
+                "frozen": {
+                    "min_age": "365d",
+                    "actions": {
+                        "searchable_snapshot": {
+                            "snapshot_repository": "found-snapshots"
+                        }
+                    },
+                },
+            }
+        }
+    }
+    client.ilm.put_lifecycle(name=ILM_POLICY_DAILY, body=frozen_daily)
+    _log(f"[green]✓[/green] {ILM_POLICY_DAILY}: frozen min_age changed to 365d" if console
+         else f"✓ {ILM_POLICY_DAILY}: frozen min_age changed to 365d")
+
+    _log("\n[bold]ILM locked down.[/bold] No further rollovers or freezing will occur." if console
+         else "\nILM locked down. No further rollovers or freezing will occur.")
+    _log("The frozen tier is now stable for Sharderator testing." if console
+         else "The frozen tier is now stable for Sharderator testing.")
+
+
 def cleanup_cluster(client: Elasticsearch, dry_run: bool = False, console=None) -> None:
     """Remove all test artifacts from the cluster."""
     _log = console.print if console else print
