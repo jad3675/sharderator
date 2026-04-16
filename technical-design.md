@@ -481,7 +481,11 @@ Indices are classified into four tiers based on store size. Each tier has a `Tie
 
 ## 17. Export Feature
 
-Three export types for change ticket documentation and operational record-keeping.
+Five export types for change ticket documentation and operational record-keeping.
+
+**Frozen tier analysis** — The Frozen Analyze tab has an Export button that saves the full health report as HTML or JSON. `FrozenAnalysis.format_html()` generates a self-contained HTML document with inline CSS, color-coded budget bar, flexbox summary cards, over-sharded and mergeable pattern tables, and a recommendation box. Print-friendly via `@media print` styles — Ctrl+P in any browser produces a clean PDF. JSON output uses `FrozenAnalysis.to_dict()` with cluster name and timestamp. CLI: `sharderator-cli analyze --json`.
+
+**Post-operation change report** — After every batch (shrink or merge) completes, the completion summary dialog includes a "Save Report" button. The report captures before/after shard counts (pre-operation count stored in `_batch_shards_before` at batch start), shards reclaimed, completed items list, failed items with error details, and cluster metadata. Available as HTML (same professional styling as the analysis export) or JSON. Designed for change control ticket attachments.
 
 **Frozen index list** — `SizingReport.to_dict()` serializes the report using `dataclasses.asdict()`. The Shrink Mode tab has an Export button that saves the frozen index table as CSV or JSON via a file save dialog. CLI: `sharderator-cli list --csv` or `--json`.
 
@@ -513,7 +517,7 @@ A right-click context menu provides Resume (re-queues the job from its last comm
 - **Categorization counts:** already optimal (1 shard), already sharderated (`-sharderated` suffix), already merged (`-merged` suffix), unrecognized naming
 - **Aggregate savings:** total shrink savings, total merge savings at each granularity
 
-`FrozenAnalysis.format_text()` produces a human-readable report with a Unicode budget bar, tables, and recommendations. `FrozenAnalysis.to_dict()` produces JSON-serializable output for automation.
+`FrozenAnalysis.format_text()` produces a human-readable report with a Unicode budget bar, tables, and recommendations. `FrozenAnalysis.to_dict()` produces JSON-serializable output for automation. `FrozenAnalysis.format_html()` generates a self-contained HTML document with inline CSS suitable for printing to PDF.
 
 ### GUI: `analyze_widget.py`
 
@@ -525,7 +529,11 @@ The "Frozen Analyze" tab is the first tab in the main window — the starting po
 - **Mergeable patterns table** — sortable `QTableWidget`. Columns: Base Pattern, Indices, Shards, → Monthly, Savings, Size (MB).
 - **Recommendation bar** — bottom-line summary with total reclaimable shards, breakdown, and projected budget.
 
-Auto-populates on connect and on every refresh (F5). Clears on disconnect.
+Auto-populates on connect and on every refresh (F5). Clears on disconnect. Export button saves the report as HTML or JSON via file dialog.
+
+### Batch Completion Dialog
+
+When a shrink or merge batch finishes, a `QMessageBox` pops up showing: items completed/failed, shards reclaimed, updated budget. A "Save Report" button generates a post-operation change report (HTML or JSON) documenting before/after shard counts, completed items, and failed items with error details.
 
 ### CLI: `sharderator-cli analyze`
 

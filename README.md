@@ -111,6 +111,8 @@ The first tab in the GUI (and the `analyze` CLI subcommand) provides a frozen ti
 
 The analysis auto-populates on connect and refreshes with F5. CLI: `sharderator-cli analyze` (text) or `sharderator-cli analyze --json`.
 
+**Export:** The Export button on the Analyze tab saves the report as HTML (opens in any browser, prints to PDF via Ctrl+P) or JSON. The HTML report includes a color-coded budget bar, summary cards, sortable tables, and recommendations — professional enough for a change ticket attachment.
+
 ## Modes
 
 ### Shrink Mode
@@ -198,7 +200,11 @@ Timeouts and throttles are automatically applied based on index size. Config val
 
 ## Export
 
-Three export types for change ticket documentation and operational record-keeping:
+Five export types for change ticket documentation and operational record-keeping:
+
+**Frozen tier analysis** — Export button on the Frozen Analyze tab saves the full health report as HTML (printable to PDF via Ctrl+P) or JSON. Includes budget bar, over-sharded indices, mergeable patterns, and recommendations. CLI: `sharderator-cli analyze --json`.
+
+**Post-operation change report** — After every batch completes, the completion dialog includes a "Save Report" button. Saves an HTML or JSON report documenting what changed: before/after shard counts, shards reclaimed, list of completed and failed items with error details. Designed for change control ticket attachments.
 
 **Frozen index list** — Export button on the Shrink Mode tab saves the current frozen index table as CSV or JSON. CLI: `sharderator-cli list --csv` or `--json`.
 
