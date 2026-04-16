@@ -46,10 +46,10 @@ sharderator
 ```
 
 1. Click **Connect** — enter Cloud ID + API Key, or Host + Basic Auth
-2. The frozen index table populates automatically, sorted by shard count
+2. The **Frozen Analyze** tab populates automatically with a shard budget bar, over-sharded indices, mergeable patterns, and recommendations
 3. Pick a mode:
-   - **Shrink Mode** — select over-sharded indices, click Dry Run, then Execute
-   - **Merge Mode** — click Analyze Merges, check the groups you want, Dry Run, then Execute Merge
+   - **Shrink Mode** — select over-sharded indices (filter + Select All for bulk selection), click Dry Run, then Execute
+   - **Merge Mode** — click Analyze Merges, check the groups you want (filter + Select All), Dry Run, then Execute Merge
    - **Job Tracker** — view in-flight/failed jobs, resume or delete them
 4. Press **F5** or click **Refresh** to reload cluster state after operations complete
 
@@ -58,6 +58,12 @@ The defrag visualization grid at the bottom shows real-time progress — each sh
 ### CLI
 
 ```bash
+# Analyze frozen tier health — shard budget, over-sharded indices, merge opportunities
+sharderator-cli analyze --cloud-id $CLOUD_ID --api-key $ES_API_KEY
+
+# Same as JSON for automation
+sharderator-cli analyze --cloud-id $CLOUD_ID --api-key $ES_API_KEY --json
+
 # List all frozen indices
 sharderator-cli list --cloud-id $CLOUD_ID --api-key $ES_API_KEY
 
@@ -84,6 +90,26 @@ sharderator-cli list --cloud-id $CLOUD_ID
 ```
 
 The CLI includes a terminal defrag visualization (ANSI-colored block characters that wrap to terminal width), signal handling for graceful cancellation (Ctrl+C), pre-run sizing reports, and all the same safety checks as the GUI.
+
+## Frozen Analyze
+
+The first tab in the GUI (and the `analyze` CLI subcommand) provides a frozen tier health report — answering "what does my frozen tier look like and where are the problems?" before you commit to any action.
+
+**Shard budget bar** — color-coded progress bar showing total frozen shards vs. the cluster limit. Green (<75%), yellow (75-90%), orange (90-100%), red (over limit).
+
+**Summary cards** — four at-a-glance metrics:
+- **Over-Sharded** — indices with ≥2 shards that are candidates for shrink mode, with total reclaimable shards
+- **Mergeable** — base patterns with multiple daily indices that can be consolidated, with total reclaimable shards
+- **Already Optimal** — indices with 1 shard that need no action
+- **Processed** — indices already handled by Sharderator (count of `-sharderated` and `-merged` suffixed indices)
+
+**Over-sharded table** — sortable table of shrink candidates, sorted by shard count descending (biggest offenders first). Shows index name, current shards, target, savings, and size.
+
+**Mergeable patterns table** — sortable table of merge candidates, sorted by monthly savings descending. Shows base pattern, index count, current shards, projected shards after monthly merge, savings, and total size.
+
+**Recommendation bar** — bottom-line summary: total reclaimable shards, breakdown by shrink vs. merge, and projected budget after consolidation.
+
+The analysis auto-populates on connect and refreshes with F5. CLI: `sharderator-cli analyze` (text) or `sharderator-cli analyze --json`.
 
 ## Modes
 
@@ -264,6 +290,13 @@ Settings persist to `~/.sharderator/config.yaml`. Credentials stored via OS keyr
 | `--backpressure-wait` | 15 | Minutes to wait between batch items under pressure (0 = no wait) |
 | `--ignore-circuit-breakers` | — | Skip circuit breaker checks entirely |
 
+### `sharderator-cli analyze`
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--json` | — | Output as JSON for automation |
+| `--min-shards` | 2 | Minimum shard count to flag as over-sharded |
+
 ### `sharderator-cli report`
 
 | Flag | Default | Description |
@@ -321,18 +354,20 @@ es-shard-defrag/                      # Main Sharderator package
 │   ├── test_preflight.py             # Health gates + circuit breaker backpressure
 │   ├── test_defrag_widget.py         # Defrag visualization
 │   ├── test_sizing.py                # Size tiers + ordering + batching
-│   └── test_snapshotter.py           # Force merge deduplication
+│   ├── test_snapshotter.py           # Force merge deduplication
+│   └── test_task_waiter.py           # Transient failure classification + retry
 └── src/sharderator/
     ├── __main__.py                   # GUI entry point
     ├── cli.py                        # CLI entry point (no PyQt6 required)
     ├── gui/
-    │   ├── main_window.py            # Main window (Shrink/Merge/Tracker tabs)
+    │   ├── main_window.py            # Main window (Analyze/Shrink/Merge/Tracker tabs)
+    │   ├── analyze_widget.py         # Frozen tier health report tab
     │   ├── defrag_widget.py          # Per-shard cell grid visualization
     │   ├── qt_events.py              # Qt signal adapter for PipelineEvents
     │   ├── connection_dialog.py      # Auth configuration
     │   ├── settings_dialog.py        # Operation + safety settings
     │   ├── confirm_dialog.py         # Shrink + merge confirmation popups
-    │   ├── index_table.py            # Frozen index table model/view
+    │   ├── index_table.py            # Frozen index table model/view + filter proxy
     │   ├── merge_tree.py             # Merge candidate tree with lazy validation
     │   ├── tracker_table.py          # Job tracker table + context menu
     │   ├── job_history_dialog.py     # State transition timeline popup
@@ -341,6 +376,7 @@ es-shard-defrag/                      # Main Sharderator package
     ├── engine/
     │   ├── orchestrator.py           # Shrink pipeline state machine
     │   ├── merge_orchestrator.py     # Merge pipeline state machine
+    │   ├── frozen_analyzer.py        # Frozen tier health analysis
     │   ├── events.py                 # PipelineEvents protocol + NullEvents
     │   ├── preflight.py              # Health + disk + breaker checks + backpressure
     │   ├── sizing.py                 # Size tiers, ordering, dynamic batching, reports

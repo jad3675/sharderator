@@ -1,7 +1,7 @@
 # Sharderator — Technical Design Document
 
 Date: April 2026
-Version: 0.3.0
+Version: 0.5.0
 
 ---
 
@@ -159,7 +159,7 @@ Restores from the backing snapshot with `_tier_preference` override to route to 
 
 Prefers the Shrink API (hard-link based, dramatically faster than reindex). Selects the warm/hot node with the most available disk, relocates all primaries there, waits for colocation confirmation by polling `_cat/shards` (not just green health — green doesn't guarantee all primaries are on the target node). Falls back to async reindex if the target shard count isn't a factor of the source.
 
-Reindex runs asynchronously via the tasks API with configurable `requests_per_second` throttle (tier profile may reduce this further). On transient failures (unavailable shards, node disconnects), retries up to 3 times with `conflicts:proceed` to skip already-indexed docs.
+Reindex runs asynchronously via the tasks API with configurable `requests_per_second` throttle (tier profile may reduce this further). Uses a 30-minute scroll keepalive (`source.scroll: 30m`) to prevent scroll expiry on object-storage-backed shards under cluster pressure. On transient failures (unavailable shards, node disconnects, scroll expiry), retries up to 3 times with `conflicts:proceed` to skip already-indexed docs. Each retry waits for the target index to go green, then fires a fresh reindex with a new scroll context.
 
 ### 5.4 Force Merge and Snapshot
 
@@ -169,7 +169,7 @@ Creates a one-off snapshot with `sharderator-{original_name}-{timestamp}` naming
 
 ### 5.5 Remounting and Verification
 
-Mounts the new snapshot as `shared_cache` (frozen) with a `partial-sharderator-{name}` naming convention so the new mount is visible to `list_frozen_indices`, `_count_frozen_shards`, and sizing reports. Checks for and deletes stale mounts from previous failed runs before mounting. Strips ILM (`index.lifecycle.indexing_complete: true`) to prevent re-processing.
+Mounts the new snapshot as `shared_cache` (frozen) with a `{original_frozen_name}-sharderated` naming convention — e.g., `partial-.ds-test-oversharded-10-metrics-2026.04.15-000001-sharderated`. This preserves the `partial-.ds-` prefix that Kibana, ILM, and Elastic Cloud tooling expect for data stream grouping, while the `-sharderated` suffix is greppable across the cluster. Double-suffixing is prevented via `.removesuffix("-sharderated")`. Stale mount cleanup checks both the new suffix-based name and the legacy `partial-sharderator-` prefix for transition safety. Strips ILM (`index.lifecycle.indexing_complete: true`) to prevent re-processing.
 
 Verification uses `_wait_for_doc_count()` which polls with a 60-second timeout for frozen index stats to become available (frozen indices are partially mounted searchable snapshots; their stats can take several seconds to populate after mount). Compares the stored expected doc count against the new mount's actual count, checks shard count matches target, confirms green health, and validates mapping field equivalence.
 
@@ -179,7 +179,7 @@ Data stream backing index swap happens in the SWAPPING state, **after** verifica
 
 ### 5.7 Cleanup
 
-Deletes the old frozen mount, intermediate restored index, intermediate shrunk index. Optionally deletes the old snapshot, but only after checking that no other indices are mounted from it — including cold-tier `restored-*` mounts and manually mounted bare indices.
+Deletes the old frozen mount, intermediate restored index, intermediate shrunk index. Optionally deletes the old snapshot, but only after checking that no other indices are mounted from it — including cold-tier `restored-*` mounts, manually mounted bare indices, and `-sharderated` suffixed mounts (reconstructed by stripping `sharderator-shrunk-`/`sharderator-restore-` working prefixes from snapshot index names).
 
 ## 6. Merge Mode Pipeline Detail
 
@@ -192,7 +192,7 @@ partial-.ds-metrics-system.cpu-default-2026.02.14-000804
   ^prefix   ^base_pattern                ^date    ^generation
 ```
 
-Groups by `(base_pattern, time_bucket)` where the bucket is monthly, quarterly, or yearly. Groups with fewer than 2 indices are excluded.
+Groups by `(base_pattern, time_bucket)` where the bucket is monthly, quarterly, or yearly. Groups with fewer than 2 indices are excluded. The `INDEX_PATTERN` regex includes an optional `(?:-sharderated)?` suffix so previously sharderated indices can be included in future merge proposals — the suffix is stripped during matching so it doesn't pollute base name grouping. `_parse_merged_name()` also strips `-sharderated` before parsing for merge job resume compatibility.
 
 ### 6.2 Lazy Validation
 
@@ -210,7 +210,7 @@ Creates the target index with union mappings and merged analysis settings (norma
 
 `union_mappings` now returns `(merged_mapping, conflicts)`. Any field type conflicts (e.g., `status` is `keyword` in some indices and `text` in others) are logged at WARNING level before the index is created. The first-seen-wins resolution strategy is unchanged — the conflicts list provides transparency without blocking the merge.
 
-Reindex runs asynchronously via the tasks API with tier-adaptive `requests_per_second` throttle. On transient failures, retries up to 3 times with `conflicts:proceed` to skip already-indexed docs.
+Reindex runs asynchronously via the tasks API with tier-adaptive `requests_per_second` throttle and a 30-minute scroll keepalive (`source.scroll: 30m`). On transient failures, retries up to 3 times with `conflicts:proceed` to skip already-indexed docs.
 
 ### 6.5 Atomic Multi-DS Swap
 
@@ -222,17 +222,17 @@ After verification, all source backing indices across all data streams are remov
 
 Run at the start of every fresh job (not on resume) and during dry runs:
 - Cluster health: red = block, yellow = configurable, >10 relocating/initializing shards = block
-- Circuit breakers: any breaker >80% triggers adaptive wait (see 7.4)
+- Circuit breakers: any data-node breaker >80% triggers adaptive wait (see 7.4). Non-data nodes (master-only, tiebreaker, ML) are excluded — their memory pressure is irrelevant to Sharderator's workload.
 - Disk space: calculates post-operation free percentage on working tier nodes only
 
 ### 7.2 Mid-Operation Monitoring
 
-Between every pipeline stage, `_check_cancel` also calls `check_cluster_health_mid_operation`. This checks:
+Between every pipeline stage, `_check_cancel` also calls `check_cluster_health_mid_operation`. This checks (data nodes only — tiebreaker/master-only/ML nodes are skipped via `_is_data_node()`):
 - Red cluster status (pause up to 15 minutes, then abort)
 - Circuit breaker ratios at 75% threshold (5 points below the hard gate)
 - Thread pool queue depths (write, search, snapshot) — warns if queue > 100
 - Pending cluster tasks — warns if > 50
-- JVM heap pressure — warns if any node > 85%
+- JVM heap pressure — warns if any data node > 85%
 - Relocating/initializing shard counts
 
 On pressure detection, waits with linear backoff (30s, 60s, 90s... up to 300s cap). Logs and continues rather than failing — the operator chose to run.
@@ -254,7 +254,7 @@ The mid-operation pressure check now includes circuit breaker ratios via `_get_h
 **Layer C — Inter-index backpressure (`wait_for_cluster_ready`):**
 Called between indices/groups in all four batch loops (CLI shrink, CLI merge, GUI ShrinkWorkerThread, GUI MergeWorkerThread). Combines health + breaker + pressure checks with adaptive waiting. If all checks pass immediately, returns with zero delay — no artificial overhead on healthy clusters. Configurable via `batch_backpressure_timeout_minutes` (default 15, 0 = disabled).
 
-The shared helper `_get_hot_breakers(client, threshold)` scans all nodes for circuit breakers above the given threshold and returns `(breaker_name, node_name, ratio)` tuples. Both the preflight gate and the pressure check use this helper, eliminating code duplication.
+The shared helper `_get_hot_breakers(client, threshold)` scans data nodes for circuit breakers above the given threshold and returns `(breaker_name, node_name, ratio)` tuples. Non-data nodes (master-only, tiebreaker, ML, ingest) are skipped via `_is_data_node()` which checks for any data-tier role (`data`, `data_hot`, `data_warm`, `data_cold`, `data_frozen`, `data_content`). The `nodes.stats` calls include the `os` metric to get the `roles` field. Both the preflight gate and the pressure check use this helper, eliminating code duplication.
 
 **Behavior before backpressure:**
 ```
@@ -313,9 +313,13 @@ Tooltips show per-cell detail: index name, shard number (e.g., "Shard: 3/7"), st
 
 The CLI equivalent uses ANSI-colored block characters that wrap to terminal width and update in-place via cursor-up + clear.
 
+### Merge Name Mapping
+
+During merge operations, the orchestrator emits state changes keyed by the merged output name (e.g., `partial-.ds-...-2026.04-merged`), but the defrag grid is keyed by source index names. A `_merge_name_map: dict[str, list[str]]` bridges this gap — `set_merge_groups()` registers the mapping from merged output names to source index names. When `update_state()` receives a merged name, it fans out the state change to all source index groups. This applies to state updates, progress updates, completion collapse, failure marking, and the active-index highlight in `paintEvent`. Both the GUI `DefragWidget` and the CLI `TerminalDefrag` implement this mapping.
+
 ## 9. CLI Mode
 
-`sharderator-cli` provides headless operation with no PyQt6 dependency. Subcommands: `list`, `status`, `shrink`, `merge`, `report`. Full argument parsing for connection and operation settings, environment variable support (`ES_API_KEY`, `ES_PASSWORD`), and SIGINT/SIGTERM signal handling for graceful cancellation.
+`sharderator-cli` provides headless operation with no PyQt6 dependency. Subcommands: `list`, `status`, `analyze`, `shrink`, `merge`, `report`. Full argument parsing for connection and operation settings, environment variable support (`ES_API_KEY`, `ES_PASSWORD`), and SIGINT/SIGTERM signal handling for graceful cancellation.
 
 The CLI reuses the same `Orchestrator` and `MergeOrchestrator` classes as the GUI, passing a `CliEvents` implementation instead of `QtPipelineEvents`. No `QApplication` instance is needed.
 
@@ -339,15 +343,16 @@ For merge mode, `_atomic_swap_multi_ds` collapses all add/remove actions across 
 
 ## 12. Unit Test Suite
 
-92 unit tests across 7 files, running in ~0.8s with no cluster dependency:
+143 unit tests across 9 files, running in ~1s with no cluster dependency:
 
 - `test_job.py` — State machine transitions (every valid path, every invalid path, terminal states, error storage, serialization round-trips using `dataclasses.asdict`)
 - `test_index_info.py` — `needs_reindex`, `shard_reduction`, `store_size_mb` properties
-- `test_merge_analyzer.py` — Index grouping at monthly/quarterly granularity, single-index exclusion, shard reduction calculation, mapping union with field drift and type conflicts. `TestMergeGroupFromJob` covers `from_job_record()` round-trips for both naming formats, fallback without enriched metadata, yearly buckets, and empty source indices. Analysis settings conflict detection and union.
-- `test_preflight.py` — Cluster health gates (red/yellow/green, relocating, initializing). Circuit breaker backpressure: `_get_hot_breakers` scanning (empty, single hot, multi-node, zero limit, custom threshold), `check_circuit_breakers` wait-then-clear and wait-then-fail with mocked time, `check_circuit_breakers_instant` no-sleep guarantee, `_check_cluster_pressure` breaker integration at 75% threshold, `wait_for_cluster_ready` zero-delay on healthy clusters and wait-then-clear with mocked sleep.
-- `test_defrag_widget.py` — Per-shard cell creation, group mapping, state updates with sweep queuing, completion collapse (target cells green, excess cells freed), failed state handling, progress tracking, paint rendering, reset, and edge cases
+- `test_merge_analyzer.py` — Index grouping at monthly/quarterly granularity, single-index exclusion, shard reduction calculation, mapping union with field drift and type conflicts. `TestMergeGroupFromJob` covers `from_job_record()` round-trips for both naming formats, fallback without enriched metadata, yearly buckets, and empty source indices. Analysis settings conflict detection and union. `TestSharderatedSuffix` covers `INDEX_PATTERN` matching for `-sharderated` suffixed indices, `_parse_merged_name` with sharderated suffix, and `propose_merges` grouping sharderated indices alongside normal ones.
+- `test_preflight.py` — Cluster health gates (red/yellow/green, relocating, initializing). Circuit breaker backpressure: `_get_hot_breakers` scanning (empty, single hot, multi-node, zero limit, custom threshold), `check_circuit_breakers` wait-then-clear and wait-then-fail with mocked time, `check_circuit_breakers_instant` no-sleep guarantee, `_check_cluster_pressure` breaker integration at 75% threshold, `wait_for_cluster_ready` zero-delay on healthy clusters and wait-then-clear with mocked sleep. Node filtering: `_is_data_node` parametrized across all 6 data roles and 6 non-data roles, mixed roles, empty/missing roles. Integration tests verifying tiebreaker nodes are skipped by circuit breaker checks, pressure checks, and `_get_hot_breakers`.
+- `test_defrag_widget.py` — Per-shard cell creation, group mapping, state updates with sweep queuing, completion collapse (target cells green, excess cells freed), failed state handling, progress tracking, paint rendering, reset, and edge cases. Merge name mapping: fan-out state updates, completed collapse across all source groups, failed marking, progress fan-out, unknown merged name handling, map clearing on set_indices and reset.
 - `test_sizing.py` — Size tier classification, tier profile lookup, sort ordering (smallest-first/largest-first/as-is), priority queuing, dynamic batch sizing by disk budget
 - `test_snapshotter.py` — Force merge deduplication with exact bracket matching
+- `test_task_waiter.py` — Transient failure classification: parametrized across all 10 entries in `TRANSIENT_FAILURE_TYPES` (including `search_context_missing_exception` and `search_phase_execution_exception`), nested `caused_by` transient detection, permanent type rejection, empty cause handling. `wait_for_task` integration: all-transient failures raise `TransientReindexError`, mixed failures raise `PermanentReindexError`, clean completion returns normally.
 
 ## 13. End-to-End Test Suite
 
@@ -496,7 +501,78 @@ A right-click context menu provides Resume (re-queues the job from its last comm
 
 `_parse_merged_name()` in `merge_analyzer.py` extracts `base_pattern` and `time_bucket` from the merged index name. Handles both the final frozen mount format (`partial-.ds-{base}-{bucket}-merged`) and the intermediate working name format (`sharderator-merged-{base}-{bucket}`).
 
-## 19. Known Limitations
+## 19. Frozen Tier Analysis
+
+### Engine: `frozen_analyzer.py`
+
+`analyze_frozen_tier(indices, frozen_limit, min_shards_for_shrink)` takes the list of frozen `IndexInfo` objects and produces a `FrozenAnalysis` dataclass containing:
+
+- **Budget metrics:** total shards, limit, usage percentage, status (OK/WARNING/CRITICAL/OVER LIMIT)
+- **Over-sharded indices:** sorted by shard count descending, with per-index savings calculation
+- **Mergeable patterns:** each `PatternSummary` contains the base pattern, index count, total shards, and projected shards after monthly/quarterly/yearly merge. Uses `propose_merges()` internally at each granularity to compute accurate group counts and savings.
+- **Categorization counts:** already optimal (1 shard), already sharderated (`-sharderated` suffix), already merged (`-merged` suffix), unrecognized naming
+- **Aggregate savings:** total shrink savings, total merge savings at each granularity
+
+`FrozenAnalysis.format_text()` produces a human-readable report with a Unicode budget bar, tables, and recommendations. `FrozenAnalysis.to_dict()` produces JSON-serializable output for automation.
+
+### GUI: `analyze_widget.py`
+
+The "Frozen Analyze" tab is the first tab in the main window — the starting point after connecting. It contains:
+
+- **BudgetBar** — a `QProgressBar` subclass with color-coded chunk styling (green/yellow/orange/red) and dark background. Uses 1000-step granularity for smooth rendering at low percentages.
+- **Summary cards** — four `SummaryCard(QFrame)` widgets with `QFrame.Shape.Box` borders, each showing a title and detail text.
+- **Over-sharded table** — sortable `QTableWidget` with numeric sorting via `setData(DisplayRole, int)`. Columns: Index Name, Shards, Target, Savings, Size (MB).
+- **Mergeable patterns table** — sortable `QTableWidget`. Columns: Base Pattern, Indices, Shards, → Monthly, Savings, Size (MB).
+- **Recommendation bar** — bottom-line summary with total reclaimable shards, breakdown, and projected budget.
+
+Auto-populates on connect and on every refresh (F5). Clears on disconnect.
+
+### CLI: `sharderator-cli analyze`
+
+Text output includes a Unicode budget bar (`█░`), over-sharded table (top 15), mergeable patterns table (top 20), summary counts, and recommendations with projected budget. `--json` outputs the full `FrozenAnalysis.to_dict()`. `--min-shards` controls the over-sharded threshold (default 2).
+
+### Shrink Guard
+
+The shrink orchestrator includes a guard after `analyze()` that detects `shard_count <= target_shard_count` and skips the index immediately (marks COMPLETED, no restore/shrink/snapshot cycle). This prevents merged indices (1 shard) from entering the shrink pipeline. The CLI also pre-filters with `shard_count > target_shard_count` before the orchestrator loop.
+
+## 20. Select All and Filter
+
+Both Shrink Mode and Merge Mode tabs have a filter bar above their table/tree:
+
+```
+[ Filter indices...          ] [Select All] [Deselect All]
+```
+
+**Shrink Mode** uses `IndexFilterProxy(QSortFilterProxyModel)` between the view and the source model. The proxy's `filterAcceptsRow()` matches against column 1 (Index Name) using `fnmatch` for glob patterns (`*apache*`) or substring matching when no wildcards are present. `visible_source_rows()` returns source-model row indices for all currently visible rows, which `select_visible()` / `deselect_visible()` on the model use for bulk check/uncheck.
+
+**Merge Mode** uses item visibility on the `QTreeWidget` — `apply_filter()` iterates top-level items (pattern groups) and calls `setHidden()` based on whether the pattern name matches. `select_visible()` / `deselect_visible()` iterate visible items and batch check state changes with `blockSignals(True)`, then run lazy validation afterward to avoid hammering the cluster with N individual validation calls.
+
+**Selection persistence:** Checked items survive across refreshes and re-analysis. `get_checked_names()` / `restore_checked_names()` on the shrink model stash and restore by index name. `get_checked_keys()` / `restore_checked_keys()` on the merge tree stash and restore by `base_pattern|time_bucket` key.
+
+**Ctrl+A** triggers Select All for the active tab (Shrink or Merge, not Job Tracker).
+
+**Targeted bulk selection workflow:** Type `*apache*` → Select All → clear filter → type `*docker*` → Select All → both sets are now checked. Deselect All only affects visible (filtered) rows.
+
+## 21. Scroll Context and Reindex Resilience
+
+### Transient Failure Classification
+
+`task_waiter.py` maintains a `TRANSIENT_FAILURE_TYPES` set used by `_is_transient_failure()` to classify reindex doc failures. Two scroll-related types were added:
+
+- `search_context_missing_exception` — the scroll cursor expired between batch fetches. The data is still there; retrying creates a fresh scroll.
+- `search_phase_execution_exception` — a wrapper that sometimes contains scroll failures as a nested cause.
+
+When all doc failures in a completed reindex task are transient, `wait_for_task()` raises `TransientReindexError`. When any failure is non-transient, it raises `PermanentReindexError`. The retry loops in both merge and shrink paths catch `TransientReindexError` and retry with `conflicts:proceed`.
+
+### Scroll Keepalive
+
+Both `merge_reindex()` in `merger.py` and `_reindex_async()` in `shrinker.py` set `source.scroll: 30m` in the reindex body. The default 5-minute keepalive is too short for object-storage-backed frozen-tier shards under cluster pressure. The 30-minute keepalive is per-batch (each scroll fetch resets the timer), not total operation time.
+
+### Shrink Reindex Retry
+
+`wait_for_reindex()` in `shrinker.py` now includes a retry loop matching the merge path's pattern. On `TransientReindexError`: backs off with linear delay (30s × attempt), waits for the target index to go green, fires a new reindex with `conflicts:proceed` and a fresh 30m scroll, and updates `job.merge_task_id` with the new task ID. Up to 3 retries. `PermanentReindexError` propagates immediately.
+
+## 22. Known Limitations
 
 - Cross-index merge (combining indices from different base patterns) is not supported. Each merge group must share a base pattern.
 - The tool assumes standard Elastic naming conventions (`partial-`, `.ds-`, generation numbers). Indices with non-standard names may not be detected by the merge analyzer.
