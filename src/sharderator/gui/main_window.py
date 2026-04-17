@@ -456,7 +456,7 @@ class MainWindow(QMainWindow):
             from sharderator.engine.frozen_analyzer import analyze_frozen_tier
             analysis = analyze_frozen_tier(
                 self._frozen_indices,
-                frozen_limit=self._conn.frozen_shard_limit,
+                topology=self._conn.frozen_topology,
             )
             self._analyze_widget.set_analysis(analysis, cluster_name=self._conn.cluster_name)
         else:

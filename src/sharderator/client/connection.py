@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 from elasticsearch import Elasticsearch
 
+from sharderator.models.frozen_topology import FrozenNodeCapacity, FrozenTopology
 from sharderator.util.config import AppConfig, ConnectionConfig
 from sharderator.util.logging import get_logger
 
 log = get_logger(__name__)
 
 MIN_ES_VERSION = (8, 7, 0)
+
+_FROZEN_CAPABLE_ROLES = {"data_frozen", "data"}
 
 
 class ClusterConnection:
@@ -20,9 +25,17 @@ class ClusterConnection:
         self.cluster_name: str = ""
         self.cluster_health: str = ""
         self.es_version: tuple[int, ...] = (0, 0, 0)
-        self.frozen_shard_limit: int = 3000
-        self.frozen_shard_count: int = 0
+        self.frozen_topology: FrozenTopology = FrozenTopology()
         self.snapshot_repos: list[str] = []
+
+    # Convenience properties — most call sites just need the headline numbers
+    @property
+    def frozen_shard_count(self) -> int:
+        return self.frozen_topology.cluster_shard_count
+
+    @property
+    def frozen_shard_limit(self) -> int:
+        return self.frozen_topology.per_node_limit
 
     @property
     def client(self) -> Elasticsearch:
@@ -73,11 +86,31 @@ class ClusterConnection:
         health = self.client.cluster.health()
         self.cluster_health = health["status"]
 
-        # Discover frozen shard limit.
-        # max_shards_per_node can be a plain string (general limit) or a dict
-        # with a "frozen" key (explicit frozen limit), depending on ES version
-        # and whether the setting has been explicitly configured.
-        self.frozen_shard_limit = 3000
+        # Discover frozen tier topology (per-node shard capacity)
+        self.frozen_topology = self._discover_frozen_topology()
+
+        # Discover snapshot repos
+        repos = self.client.snapshot.get_repository()
+        self.snapshot_repos = list(repos.keys())
+
+        hot = self.frozen_topology.hot_node
+        log.info(
+            "connected",
+            cluster=self.cluster_name,
+            version=version_str,
+            health=self.cluster_health,
+            frozen_shards=self.frozen_topology.cluster_shard_count,
+            frozen_nodes=len(self.frozen_topology.nodes),
+            per_node_limit=self.frozen_topology.per_node_limit,
+            peak_node=hot.node_name if hot else "none",
+            peak_utilization=f"{self.frozen_topology.max_node_utilization_pct:.1f}%",
+            repos=self.snapshot_repos,
+        )
+
+    def _discover_frozen_topology(self) -> FrozenTopology:
+        """Build per-node frozen shard capacity model."""
+        # 1. Read per-node limit from cluster settings
+        per_node_limit = 3000
         try:
             settings = self.client.cluster.get_settings(include_defaults=True)
             for scope in ("transient", "persistent", "defaults"):
@@ -86,47 +119,79 @@ class ClusterConnection:
                 if isinstance(msn, dict):
                     val = msn.get("frozen")
                     if val is not None:
-                        self.frozen_shard_limit = int(val)
+                        per_node_limit = int(val)
                         break
                 elif isinstance(msn, str) and msn:
-                    self.frozen_shard_limit = int(msn)
+                    per_node_limit = int(msn)
                     break
         except Exception:
             pass
 
-        self._count_frozen_shards()
+        # 2. Discover frozen-capable nodes
+        frozen_nodes: dict[str, FrozenNodeCapacity] = {}
+        try:
+            nodes_info = self.client.nodes.info(metric="os")
+            for node_id, node_data in nodes_info.get("nodes", {}).items():
+                roles = node_data.get("roles", [])
+                if _FROZEN_CAPABLE_ROLES.intersection(roles):
+                    frozen_nodes[node_data.get("name", node_id)] = FrozenNodeCapacity(
+                        node_id=node_id,
+                        node_name=node_data.get("name", node_id),
+                        roles=roles,
+                        shard_count=0,
+                        shard_limit=per_node_limit,
+                    )
+        except Exception as e:
+            log.warning("frozen_topology_nodes_info_failed", error=str(e))
+            # Fall back to counting shards without node topology
+            return self._frozen_topology_fallback(per_node_limit)
 
-        # Discover snapshot repos
-        repos = self.client.snapshot.get_repository()
-        self.snapshot_repos = list(repos.keys())
+        if not frozen_nodes:
+            # No frozen-capable nodes found — fall back
+            return self._frozen_topology_fallback(per_node_limit)
 
-        log.info(
-            "connected",
-            cluster=self.cluster_name,
-            version=version_str,
-            health=self.cluster_health,
-            frozen_shards=self.frozen_shard_count,
-            frozen_limit=self.frozen_shard_limit,
-            repos=self.snapshot_repos,
+        # 3. Count frozen shards per node
+        try:
+            shards = self.client.cat.shards(format="json", h="index,node,prirep,state")
+            for s in shards:
+                if not isinstance(s, dict):
+                    continue
+                name = s.get("index", "")
+                if not (name.startswith("partial-") or name.startswith(".partial-")):
+                    continue
+                state = s.get("state", "")
+                if state == "UNASSIGNED":
+                    continue
+                node_name = s.get("node", "")
+                if node_name in frozen_nodes:
+                    frozen_nodes[node_name].shard_count += 1
+                elif node_name:
+                    # Shard on a node not in our frozen-capable list — could be
+                    # a node with legacy roles or one that left between API calls
+                    log.debug("frozen_shard_on_unknown_node", node=node_name, index=name)
+        except Exception as e:
+            log.warning("frozen_topology_shard_count_failed", error=str(e))
+
+        return FrozenTopology(
+            nodes=list(frozen_nodes.values()),
+            per_node_limit=per_node_limit,
         )
 
-    def _count_frozen_shards(self) -> None:
-        """Count ALL shards (primaries + replicas) on frozen-tier indices.
-
-        Fix 2.2: The cluster.max_shards_per_node.frozen limit counts all shards,
-        not just primaries. We must count replicas too.
-        """
-        shards = self.client.cat.shards(format="json", h="index,node,prirep")
-        frozen_count = sum(
-            1
-            for s in shards
-            if isinstance(s, dict)
-            and (
-                s.get("index", "").startswith("partial-")
-                or s.get("index", "").startswith(".partial-")
+    def _frozen_topology_fallback(self, per_node_limit: int) -> FrozenTopology:
+        """Degraded mode: count cluster-wide frozen shards without per-node breakdown."""
+        total = 0
+        try:
+            shards = self.client.cat.shards(format="json", h="index,node,prirep")
+            total = sum(
+                1 for s in shards
+                if isinstance(s, dict)
+                and (s.get("index", "").startswith("partial-")
+                     or s.get("index", "").startswith(".partial-"))
             )
-        )
-        self.frozen_shard_count = frozen_count
+        except Exception:
+            pass
+        log.warning("frozen_topology_degraded", total_shards=total, per_node_limit=per_node_limit)
+        return FrozenTopology.single_node_fallback(total, per_node_limit)
 
     def disconnect(self) -> None:
         if self._client is not None:

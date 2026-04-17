@@ -40,6 +40,19 @@ class BudgetBar(QProgressBar):
         self.setFormat(f"  {used:,} / {limit:,} shards  ({pct:.1f}%)  ")
         self._update_style(pct)
 
+    def set_budget_detail(
+        self, node_shards: int, node_limit: int, node_name: str,
+        cluster_total: int, cluster_capacity: int,
+    ) -> None:
+        """Show per-node peak with cluster context."""
+        pct = node_shards / node_limit * 100 if node_limit else 0
+        self.setValue(min(int(pct * 10), 1000))
+        self.setFormat(
+            f"  Peak: {node_shards:,}/{node_limit:,} on {node_name} ({pct:.1f}%)  "
+            f"|  Cluster: {cluster_total:,}/{cluster_capacity:,}  "
+        )
+        self._update_style(pct)
+
     def _update_style(self, pct: float) -> None:
         if pct >= 100:
             color, bg = "#e53935", "#4a1515"
@@ -208,10 +221,21 @@ class AnalyzeWidget(QWidget):
         # Budget bar
         self._budget_bar.set_budget(analysis.total_shards, analysis.frozen_limit)
         status = analysis.budget_status()
-        colors = {"OK": "#43a047", "WARNING": "#ffc107", "CRITICAL": "#ff9800", "OVER LIMIT": "#e53935"}
+        colors = {"OK": "#43a047", "WARNING": "#ffc107", "CRITICAL": "#ff9800",
+                  "OVER LIMIT": "#e53935", "HOTSPOT": "#ff5722"}
         self._lbl_status.setText(status)
         self._lbl_status.setStyleSheet(f"color: {colors.get(status, '#eee')};")
 
+        # Update budget bar to show per-node peak
+        topo = analysis.topology
+        hot = topo.hot_node
+        if hot and len(topo.nodes) > 1:
+            self._budget_bar.set_budget_detail(
+                hot.shard_count, hot.shard_limit, hot.node_name,
+                topo.cluster_shard_count, topo.cluster_shard_capacity,
+            )
+        else:
+            self._budget_bar.set_budget(analysis.total_shards, topo.cluster_shard_capacity or topo.per_node_limit)
         # Summary cards
         self._card_over_sharded.set_detail(
             f"{len(analysis.over_sharded)} indices\n{analysis.shrink_savings:,} shards reclaimable"
@@ -251,12 +275,13 @@ class AnalyzeWidget(QWidget):
         total_reclaimable = analysis.shrink_savings + analysis.merge_monthly_savings
         if total_reclaimable > 0:
             after = analysis.total_shards - total_reclaimable
-            after_pct = after / analysis.frozen_limit * 100 if analysis.frozen_limit else 0
+            cap = analysis.cluster_capacity or 1
+            after_pct = after / cap * 100
             self._lbl_recommendation.setText(
                 f"<b>{total_reclaimable:,} shards reclaimable</b> — "
                 f"Shrink: {analysis.shrink_savings:,} from {len(analysis.over_sharded)} indices  |  "
                 f"Merge (monthly): {analysis.merge_monthly_savings:,} from {len(analysis.mergeable_patterns)} patterns  |  "
-                f"Budget after: {after:,} / {analysis.frozen_limit:,} ({after_pct:.1f}%)"
+                f"Budget after: {after:,} / {cap:,} cluster capacity ({after_pct:.1f}%)"
             )
         else:
             self._lbl_recommendation.setText(

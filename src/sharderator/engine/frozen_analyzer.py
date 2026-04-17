@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, field
 
 from sharderator.engine.merge_analyzer import INDEX_PATTERN, _date_to_bucket, propose_merges
+from sharderator.models.frozen_topology import FrozenTopology
 from sharderator.models.index_info import IndexInfo
 
 
@@ -47,8 +48,7 @@ class FrozenAnalysis:
     """Complete frozen tier health analysis."""
     total_indices: int = 0
     total_shards: int = 0
-    frozen_limit: int = 3000
-    budget_used_pct: float = 0.0
+    topology: FrozenTopology = field(default_factory=FrozenTopology)
 
     # Categorized indices
     over_sharded: list[IndexInfo] = field(default_factory=list)
@@ -64,22 +64,44 @@ class FrozenAnalysis:
     merge_quarterly_savings: int = 0
     merge_yearly_savings: int = 0
 
+    @property
+    def peak_node_utilization_pct(self) -> float:
+        return self.topology.max_node_utilization_pct
+
+    @property
+    def cluster_utilization_pct(self) -> float:
+        return self.topology.cluster_utilization_pct
+
+    @property
+    def frozen_limit(self) -> int:
+        """Per-node limit — convenience for renderers."""
+        return self.topology.per_node_limit
+
+    @property
+    def cluster_capacity(self) -> int:
+        return self.topology.cluster_shard_capacity
+
     def budget_status(self) -> str:
-        if self.budget_used_pct >= 100:
+        pct = self.peak_node_utilization_pct
+        if self.topology.is_hotspot:
+            return "HOTSPOT"
+        if pct >= 100:
             return "OVER LIMIT"
-        elif self.budget_used_pct >= 90:
+        elif pct >= 90:
             return "CRITICAL"
-        elif self.budget_used_pct >= 75:
+        elif pct >= 75:
             return "WARNING"
         return "OK"
 
     def to_dict(self) -> dict:
+        hot = self.topology.hot_node
         return {
             "total_indices": self.total_indices,
             "total_shards": self.total_shards,
-            "frozen_limit": self.frozen_limit,
-            "budget_used_pct": round(self.budget_used_pct, 1),
+            "peak_node_utilization_pct": round(self.peak_node_utilization_pct, 1),
+            "cluster_utilization_pct": round(self.cluster_utilization_pct, 1),
             "budget_status": self.budget_status(),
+            "topology": self.topology.to_dict(),
             "over_sharded_count": len(self.over_sharded),
             "over_sharded_shards": sum(i.shard_count for i in self.over_sharded),
             "over_sharded": [
@@ -114,14 +136,34 @@ class FrozenAnalysis:
     def format_text(self) -> str:
         """Format as a human-readable text report."""
         lines: list[str] = []
-
-        # Budget bar
+        topo = self.topology
+        hot = topo.hot_node
         status = self.budget_status()
+
+        # Per-node peak bar
+        peak_pct = self.peak_node_utilization_pct
         bar_width = 40
-        filled = min(int(self.budget_used_pct / 100 * bar_width), bar_width)
+        filled = min(int(peak_pct / 100 * bar_width), bar_width)
         bar = "█" * filled + "░" * (bar_width - filled)
-        lines.append(f"Frozen Shard Budget: [{bar}] {self.budget_used_pct:.1f}%")
-        lines.append(f"  {self.total_shards:,} / {self.frozen_limit:,} shards across {self.total_indices:,} indices  ({status})")
+        lines.append(f"Frozen Tier Budget")
+        lines.append(f"  Per-node peak:  [{bar}] {peak_pct:.1f}%  {status}")
+        if hot:
+            lines.append(f"                  {hot.shard_count:,} / {hot.shard_limit:,} shards on {hot.node_name}")
+        lines.append("")
+        lines.append(
+            f"  Cluster-wide:   {topo.cluster_shard_count:,} / {topo.cluster_shard_capacity:,} shards "
+            f"across {len(topo.nodes)} frozen node(s) ({self.cluster_utilization_pct:.1f}%)"
+        )
+
+        # Per-node breakdown
+        if len(topo.nodes) > 1:
+            lines.append("")
+            lines.append("  Per-node breakdown:")
+            for n in sorted(topo.nodes, key=lambda x: x.utilization_pct, reverse=True):
+                marker = "  ← hot" if hot and n.node_name == hot.node_name else ""
+                lines.append(
+                    f"    {n.node_name:<30} {n.shard_count:>6} / {n.shard_limit:>6}   {n.utilization_pct:>5.1f}%{marker}"
+                )
         lines.append("")
 
         # Over-sharded singles
@@ -163,8 +205,9 @@ class FrozenAnalysis:
             lines.append(f"  → Shrink mode:  {self.shrink_savings:,} shards from {len(self.over_sharded)} indices")
             lines.append(f"  → Merge monthly: {self.merge_monthly_savings:,} shards from {len(self.mergeable_patterns)} patterns")
             after = self.total_shards - total_reclaimable
-            after_pct = after / self.frozen_limit * 100 if self.frozen_limit else 0
-            lines.append(f"  → Budget after:  {after:,} / {self.frozen_limit:,} ({after_pct:.1f}%)")
+            cap = self.cluster_capacity or 1
+            after_pct = after / cap * 100
+            lines.append(f"  → Budget after:  {after:,} / {cap:,} cluster capacity ({after_pct:.1f}%)")
         else:
             lines.append("Frozen tier is already optimally sharded.")
 
@@ -174,11 +217,27 @@ class FrozenAnalysis:
         """Format as a self-contained HTML report suitable for printing to PDF."""
         import time as _time
         ts = timestamp or _time.strftime("%Y-%m-%d %H:%M:%S")
+        topo = self.topology
+        hot = topo.hot_node
         status = self.budget_status()
-        status_colors = {"OK": "#43a047", "WARNING": "#ffc107", "CRITICAL": "#ff9800", "OVER LIMIT": "#e53935"}
+        status_colors = {"OK": "#43a047", "WARNING": "#ffc107", "CRITICAL": "#ff9800",
+                         "OVER LIMIT": "#e53935", "HOTSPOT": "#ff5722"}
         status_color = status_colors.get(status, "#888")
-        pct = min(self.budget_used_pct, 100)
+        peak_pct = min(self.peak_node_utilization_pct, 100)
+        cluster_pct = min(self.cluster_utilization_pct, 100)
         total_reclaimable = self.shrink_savings + self.merge_monthly_savings
+
+        # Per-node table rows
+        node_rows = ""
+        for n in sorted(topo.nodes, key=lambda x: x.utilization_pct, reverse=True):
+            is_hot = hot and n.node_name == hot.node_name and len(topo.nodes) > 1
+            bg = "background:#fff3e0;" if is_hot else ""
+            marker = " ← hot" if is_hot else ""
+            node_rows += (
+                f"<tr style='{bg}'><td>{n.node_name}{marker}</td>"
+                f"<td class='r'>{n.shard_count:,}</td><td class='r'>{n.shard_limit:,}</td>"
+                f"<td class='r'>{n.utilization_pct:.1f}%</td></tr>\n"
+            )
 
         rows_over = ""
         for i in self.over_sharded:
@@ -200,7 +259,10 @@ class FrozenAnalysis:
             )
 
         after = self.total_shards - total_reclaimable
-        after_pct = after / self.frozen_limit * 100 if self.frozen_limit else 0
+        cap = self.cluster_capacity or 1
+        after_pct = after / cap * 100
+
+        hot_label = f"{hot.shard_count:,} / {hot.shard_limit:,} on {hot.node_name}" if hot else ""
 
         return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -212,14 +274,14 @@ class FrozenAnalysis:
   h2 {{ color: #283593; margin-top: 24px; }}
   .meta {{ color: #666; font-size: 12px; margin-bottom: 16px; }}
   .budget-bar {{ background: #e0e0e0; border-radius: 6px; height: 32px; position: relative;
-                 margin: 12px 0; overflow: hidden; }}
-  .budget-fill {{ background: {status_color}; height: 100%; border-radius: 6px;
-                  width: {pct:.1f}%; min-width: 2px; }}
+                 margin: 8px 0; overflow: hidden; }}
+  .budget-fill {{ height: 100%; border-radius: 6px; min-width: 2px; }}
   .budget-text {{ position: absolute; top: 0; left: 0; right: 0; height: 32px;
                   line-height: 32px; text-align: center; font-weight: bold; color: #333; }}
+  .budget-small {{ height: 22px; }}
+  .budget-small .budget-text {{ height: 22px; line-height: 22px; font-size: 12px; }}
   .cards {{ display: flex; gap: 12px; margin: 16px 0; }}
-  .card {{ flex: 1; border: 1px solid #ccc; border-radius: 6px; padding: 12px;
-           text-align: center; }}
+  .card {{ flex: 1; border: 1px solid #ccc; border-radius: 6px; padding: 12px; text-align: center; }}
   .card h3 {{ margin: 0 0 4px 0; font-size: 13px; color: #555; }}
   .card .value {{ font-size: 18px; font-weight: bold; color: #1a237e; }}
   .card .sub {{ font-size: 11px; color: #888; }}
@@ -234,19 +296,27 @@ class FrozenAnalysis:
   @media print {{ body {{ font-size: 11px; }} .budget-bar {{ print-color-adjust: exact; -webkit-print-color-adjust: exact; }} }}
 </style></head><body>
 <h1>Sharderator — Frozen Tier Analysis</h1>
-<div class="meta">Cluster: {cluster_name or 'N/A'} &nbsp;|&nbsp; Generated: {ts}</div>
+<div class="meta">Cluster: {cluster_name or 'N/A'} &nbsp;|&nbsp; Generated: {ts} &nbsp;|&nbsp; {len(topo.nodes)} frozen node(s)</div>
 
+<h2>Per-Node Peak — {status}</h2>
 <div class="budget-bar">
-  <div class="budget-fill"></div>
-  <div class="budget-text">{self.total_shards:,} / {self.frozen_limit:,} shards ({self.budget_used_pct:.1f}%) — {status}</div>
+  <div class="budget-fill" style="background:{status_color};width:{peak_pct:.1f}%"></div>
+  <div class="budget-text">{hot_label} ({self.peak_node_utilization_pct:.1f}%)</div>
 </div>
+
+<div class="budget-bar budget-small">
+  <div class="budget-fill" style="background:#78909c;width:{cluster_pct:.1f}%"></div>
+  <div class="budget-text">Cluster: {topo.cluster_shard_count:,} / {topo.cluster_shard_capacity:,} ({self.cluster_utilization_pct:.1f}%)</div>
+</div>
+
+{"<h2>Per-Node Breakdown</h2><table><tr><th>Node</th><th class='r'>Shards</th><th class='r'>Limit</th><th class='r'>Utilization</th></tr>" + node_rows + "</table>" if len(topo.nodes) > 1 else ""}
 
 <div class="cards">
   <div class="card"><h3>Over-Sharded</h3><div class="value">{len(self.over_sharded)}</div><div class="sub">{self.shrink_savings:,} shards reclaimable</div></div>
   <div class="card"><h3>Mergeable</h3><div class="value">{len(self.mergeable_patterns)}</div><div class="sub">{self.merge_monthly_savings:,} shards reclaimable</div></div>
-  <div class="card"><h3>Already Optimal</h3><div class="value">{self.already_optimal}</div><div class="sub">1 shard each</div></div>
   <div class="card"><h3>Processed</h3><div class="value">{self.already_sharderated + self.already_merged}</div><div class="sub">{self.already_sharderated} sharderated, {self.already_merged} merged</div></div>
 </div>
+<div class="meta">Of {self.total_indices:,} total indices, {self.already_optimal} are already at 1 shard.</div>
 
 <h2>Over-Sharded Indices ({len(self.over_sharded)})</h2>
 <table>
@@ -264,7 +334,7 @@ class FrozenAnalysis:
   <b>{total_reclaimable:,} shards reclaimable</b><br>
   Shrink: {self.shrink_savings:,} from {len(self.over_sharded)} indices &nbsp;|&nbsp;
   Merge (monthly): {self.merge_monthly_savings:,} from {len(self.mergeable_patterns)} patterns<br>
-  Budget after: {after:,} / {self.frozen_limit:,} ({after_pct:.1f}%)
+  Budget after: {after:,} / {cap:,} cluster capacity ({after_pct:.1f}%)
 </div>
 
 <div class="meta" style="margin-top:24px">Generated by Sharderator</div>
@@ -273,17 +343,14 @@ class FrozenAnalysis:
 
 def analyze_frozen_tier(
     indices: list[IndexInfo],
-    frozen_limit: int = 3000,
+    topology: FrozenTopology,
     min_shards_for_shrink: int = 2,
 ) -> FrozenAnalysis:
     """Analyze frozen indices and categorize optimization opportunities."""
     analysis = FrozenAnalysis(
         total_indices=len(indices),
         total_shards=sum(i.shard_count for i in indices),
-        frozen_limit=frozen_limit,
-    )
-    analysis.budget_used_pct = (
-        analysis.total_shards / frozen_limit * 100 if frozen_limit else 0
+        topology=topology,
     )
 
     # Categorize each index

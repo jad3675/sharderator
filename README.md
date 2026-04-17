@@ -95,7 +95,7 @@ The CLI includes a terminal defrag visualization (ANSI-colored block characters 
 
 The first tab in the GUI (and the `analyze` CLI subcommand) provides a frozen tier health report — answering "what does my frozen tier look like and where are the problems?" before you commit to any action.
 
-**Shard budget bar** — color-coded progress bar showing total frozen shards vs. the cluster limit. Green (<75%), yellow (75-90%), orange (90-100%), red (over limit).
+**Shard budget bar** — color-coded progress bar showing **per-node peak utilization** (the binding constraint). `cluster.max_shards_per_node.frozen` is a per-node cap, not a cluster total — the bar shows the most-loaded frozen node's utilization. On multi-node clusters, a secondary cluster-wide total is shown for context. Color-coded: green (<75%), yellow (75-90%), orange (90-100%), red (over limit). A `HOTSPOT` status triggers when the peak node is 20+ points above the cluster average, signaling uneven shard distribution.
 
 **Summary cards** — four at-a-glance metrics:
 - **Over-Sharded** — indices with ≥2 shards that are candidates for shrink mode, with total reclaimable shards
@@ -403,7 +403,8 @@ es-shard-defrag/                      # Main Sharderator package
     │   └── tracker.py                # Job persistence to ES tracking index
     ├── models/
     │   ├── index_info.py             # Index metadata dataclass
-    │   └── job.py                    # Job state machine + type discriminator
+    │   ├── job.py                    # Job state machine + type discriminator
+    │   └── frozen_topology.py        # Per-node frozen tier capacity model
     └── util/
         ├── logging.py                # Structured logging (structlog)
         └── config.py                 # YAML config + keyring secrets

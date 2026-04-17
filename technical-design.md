@@ -1,7 +1,7 @@
 # Sharderator — Technical Design Document
 
 Date: April 2026
-Version: 0.5.0
+Version: 0.6.0
 
 ---
 
@@ -509,21 +509,39 @@ A right-click context menu provides Resume (re-queues the job from its last comm
 
 ### Engine: `frozen_analyzer.py`
 
-`analyze_frozen_tier(indices, frozen_limit, min_shards_for_shrink)` takes the list of frozen `IndexInfo` objects and produces a `FrozenAnalysis` dataclass containing:
+`analyze_frozen_tier(indices, topology, min_shards_for_shrink)` takes the list of frozen `IndexInfo` objects and a `FrozenTopology` and produces a `FrozenAnalysis` dataclass. The analysis uses per-node peak utilization as the binding constraint, not cluster-wide totals divided by a per-node limit.
 
-- **Budget metrics:** total shards, limit, usage percentage, status (OK/WARNING/CRITICAL/OVER LIMIT)
-- **Over-sharded indices:** sorted by shard count descending, with per-index savings calculation
-- **Mergeable patterns:** each `PatternSummary` contains the base pattern, index count, total shards, and projected shards after monthly/quarterly/yearly merge. Uses `propose_merges()` internally at each granularity to compute accurate group counts and savings.
-- **Categorization counts:** already optimal (1 shard), already sharderated (`-sharderated` suffix), already merged (`-merged` suffix), unrecognized naming
-- **Aggregate savings:** total shrink savings, total merge savings at each granularity
+Key properties on `FrozenAnalysis`:
+- `peak_node_utilization_pct` — the binding constraint (highest per-node utilization)
+- `cluster_utilization_pct` — informational (cluster total / cluster capacity)
+- `budget_status()` — returns OK/WARNING/CRITICAL/OVER LIMIT/HOTSPOT based on peak node utilization. HOTSPOT triggers when peak is 20+ points above cluster average.
 
-`FrozenAnalysis.format_text()` produces a human-readable report with a Unicode budget bar, tables, and recommendations. `FrozenAnalysis.to_dict()` produces JSON-serializable output for automation. `FrozenAnalysis.format_html()` generates a self-contained HTML document with inline CSS suitable for printing to PDF.
+### Data Model: `models/frozen_topology.py`
+
+`FrozenTopology` is a first-class representation of the frozen tier's per-node capacity:
+- `nodes: list[FrozenNodeCapacity]` — each node has `node_name`, `shard_count`, `shard_limit`, `utilization_pct`
+- `per_node_limit` — the cluster-level `max_shards_per_node.frozen` setting
+- `cluster_shard_capacity` — `len(nodes) * per_node_limit`
+- `hot_node` — the node with highest utilization
+- `is_hotspot` — True when peak is 20+ points above cluster average
+
+`FrozenTopology.single_node_fallback()` creates a synthetic single-node topology for degraded mode when `nodes.info` fails.
+
+### Connection Layer: `client/connection.py`
+
+`_discover_frozen_topology()` builds the topology by:
+1. Reading `cluster.max_shards_per_node.frozen` from cluster settings (default 3000)
+2. Discovering frozen-capable nodes via `nodes.info` (roles containing `data_frozen` or `data`)
+3. Counting frozen shards per node via `cat.shards` (filtering by `partial-` prefix, excluding UNASSIGNED)
+4. Building `FrozenNodeCapacity` entries for every frozen-capable node, including those with zero shards
+
+Convenience properties `frozen_shard_count` and `frozen_shard_limit` are preserved for backward compatibility — they delegate to the topology.
 
 ### GUI: `analyze_widget.py`
 
 The "Frozen Analyze" tab is the first tab in the main window — the starting point after connecting. It contains:
 
-- **BudgetBar** — a `QProgressBar` subclass with color-coded chunk styling (green/yellow/orange/red) and dark background. Uses 1000-step granularity for smooth rendering at low percentages.
+- **BudgetBar** — a `QProgressBar` subclass with color-coded chunk styling (green/yellow/orange/red) and dark background. Uses 1000-step granularity for smooth rendering at low percentages. On multi-node clusters, shows per-node peak utilization with the hot node name; on single-node clusters, shows simple used/limit.
 - **Summary cards** — four `SummaryCard(QFrame)` widgets with `QFrame.Shape.Box` borders, each showing a title and detail text.
 - **Over-sharded table** — sortable `QTableWidget` with numeric sorting via `setData(DisplayRole, int)`. Columns: Index Name, Shards, Target, Savings, Size (MB).
 - **Mergeable patterns table** — sortable `QTableWidget`. Columns: Base Pattern, Indices, Shards, → Monthly, Savings, Size (MB).

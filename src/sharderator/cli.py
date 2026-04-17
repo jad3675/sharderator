@@ -217,7 +217,14 @@ def _cmd_list(conn: ClusterConnection, args) -> None:
 def _cmd_status(conn: ClusterConnection, args) -> None:
     print(f"Cluster:        {conn.cluster_name}")
     print(f"Health:         {conn.cluster_health}")
-    print(f"Frozen shards:  {conn.frozen_shard_count} / {conn.frozen_shard_limit}")
+    print(f"Frozen shards:  {conn.frozen_shard_count} / {conn.frozen_shard_limit} (per-node limit)")
+    topo = conn.frozen_topology
+    if len(topo.nodes) > 1:
+        hot = topo.hot_node
+        print(f"Frozen nodes:   {len(topo.nodes)}")
+        print(f"Cluster total:  {topo.cluster_shard_count:,} / {topo.cluster_shard_capacity:,} ({topo.cluster_utilization_pct:.1f}%)")
+        if hot:
+            print(f"Peak node:      {hot.node_name} at {hot.utilization_pct:.1f}%")
     print(f"Snapshot repos: {', '.join(conn.snapshot_repos)}")
     from sharderator.client.tracker import TRACKING_INDEX
     try:
@@ -450,7 +457,7 @@ def _cmd_analyze(conn: ClusterConnection, args) -> None:
     min_shards = getattr(args, "min_shards", 2)
     analysis = analyze_frozen_tier(
         indices,
-        frozen_limit=conn.frozen_shard_limit,
+        topology=conn.frozen_topology,
         min_shards_for_shrink=min_shards,
     )
 
