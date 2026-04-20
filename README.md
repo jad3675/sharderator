@@ -244,6 +244,7 @@ Available in both GUI dry runs and CLI `--dry-run`.
 | Target shard count | 1 | Shard target for shrink mode |
 | Snapshot repository | auto-detected | Which repo to snapshot into |
 | Recovery timeout | 30 min | Minimum timeout (tier profile may increase) |
+| Working tier | data_warm,data_hot,data_content | Tier preference for restored indices (comma-separated, tries in order) |
 | Delete old snapshots | Off | Remove original snapshot after verification |
 | Disk safety margin | 0.30 | Keep 30% disk free on working tier |
 | Restore batch size | 3 | Max concurrent snapshot restores (dynamic batching may reduce) |
@@ -253,7 +254,7 @@ Available in both GUI dry runs and CLI `--dry-run`.
 | Circuit breaker wait | 10 min | How long to wait for breaker pressure to subside (0 = fail immediately) |
 | Batch backpressure wait | 15 min | How long to pause between batch items under pressure (0 = no wait) |
 
-Settings persist to `~/.sharderator/config.yaml`. Credentials stored via OS keyring.
+Settings persist to `~/.sharderator/config.yaml`. Credentials stored via OS keyring. A **Help** button in the Settings dialog opens a scrollable reference window explaining every setting in detail.
 
 ## CLI Reference
 
