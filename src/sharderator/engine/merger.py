@@ -188,6 +188,7 @@ def restore_merge_sources(
                 "indices": info.original_index_name,
                 "rename_pattern": "(.+)",
                 "rename_replacement": restore_name,
+                "include_aliases": False,
                 "index_settings": {
                     "index.routing.allocation.include._tier_preference": working_tier,
                     "index.number_of_replicas": 0,

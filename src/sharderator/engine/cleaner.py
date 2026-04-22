@@ -67,12 +67,36 @@ def cleanup_merge(
 
 
 def _safe_delete_index(client: Elasticsearch, index: str) -> None:
-    """Delete an index, ignoring 404."""
+    """Delete an index, handling alias collisions and ignoring 404.
+
+    When a restored index has aliases that match its name, the standard
+    delete API rejects with 'matches an alias'. We handle this by first
+    removing all aliases, then deleting the concrete index.
+    """
     try:
         client.indices.delete(index=index, ignore=[404])
         log.info("deleted_index", index=index)
     except Exception as e:
-        log.warning("delete_index_failed", index=index, error=str(e))
+        if "matches an alias" in str(e):
+            # The index name collides with an alias. Remove aliases first,
+            # then delete the concrete index.
+            try:
+                # Get all aliases for this index and remove them
+                alias_info = client.indices.get_alias(index=index)
+                for concrete_name, data in alias_info.items():
+                    aliases = list(data.get("aliases", {}).keys())
+                    for alias in aliases:
+                        try:
+                            client.indices.delete_alias(index=concrete_name, name=alias)
+                        except Exception:
+                            pass
+                    # Now delete the concrete index
+                    client.indices.delete(index=concrete_name, ignore=[404])
+                    log.info("deleted_index", index=concrete_name, had_alias_collision=True)
+            except Exception as inner:
+                log.warning("delete_index_failed", index=index, error=str(inner))
+        else:
+            log.warning("delete_index_failed", index=index, error=str(e))
 
 
 def _safe_delete_snapshot(
