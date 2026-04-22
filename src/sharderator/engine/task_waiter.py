@@ -137,14 +137,23 @@ def wait_for_task(
 
 
 def _is_transient_failure(failure: dict) -> bool:
-    """Check if a reindex doc failure is a transient cluster issue."""
-    cause = failure.get("cause", {})
-    if isinstance(cause, dict):
-        err_type = cause.get("type", "")
+    """Check if a reindex doc failure is a transient cluster issue.
+
+    ES reindex task failures use inconsistent structures:
+      {"cause": {"type": "...", "reason": "..."}}                    — common
+      {"reason": {"type": "...", "reason": "..."}}                   — seen in scroll expiry
+      {"cause": {"type": "...", "caused_by": {"type": "..."}}}       — nested
+    We check both 'cause' and 'reason' keys as the error container.
+    """
+    for key in ("cause", "reason"):
+        container = failure.get(key, {})
+        if not isinstance(container, dict):
+            continue
+        err_type = container.get("type", "")
         if err_type in TRANSIENT_FAILURE_TYPES:
             return True
         # Check nested caused_by
-        caused_by = cause.get("caused_by", {})
+        caused_by = container.get("caused_by", {})
         if isinstance(caused_by, dict):
             inner_type = caused_by.get("type", "")
             if inner_type in TRANSIENT_FAILURE_TYPES:
